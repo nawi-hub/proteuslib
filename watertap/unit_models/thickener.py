@@ -165,7 +165,7 @@ class ThickenerData(SeparatorData):
             initialize=1800,
             domain=NonNegativeReals,
             units=pyunits.m**3,
-            doc="Hydraulic retention time",
+            doc="Volume",
         )
 
         self.diameter = Var(

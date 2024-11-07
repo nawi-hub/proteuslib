@@ -165,7 +165,7 @@ class DewateringData(SeparatorData):
             initialize=1800,
             domain=NonNegativeReals,
             units=pyunits.m**3,
-            doc="Hydraulic retention time",
+            doc="Volume",
         )
 
         @self.Constraint(self.flowsheet().time, doc="Hydraulic retention time equation")

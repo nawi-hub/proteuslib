@@ -838,7 +838,7 @@ see reaction package for documentation.}""",
 
         # TODO: improve this later; for now, this resolved some scaling issues for modified adm1 test file
         if "S_IP" in self.config.liquid_property_package.component_list:
-            iscale.set_scaling_factor(self.liquid_phase.heat, 1e-6)
+            # iscale.set_scaling_factor(self.liquid_phase.heat, 1e-6)
             sf = iscale.get_scaling_factor(
                 self.liquid_phase.properties_out[0].conc_mass_comp["S_IP"],
                 default=1e-5,

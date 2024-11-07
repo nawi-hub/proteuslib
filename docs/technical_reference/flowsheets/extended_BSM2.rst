@@ -192,6 +192,11 @@ Additional Variables
    "Reactor 6 oxygen mass transfer coefficient",":math:`KLa_{R6}`", "240", ":math:`\text{hr}^{-1}`"
    "Reactor 7 oxygen mass transfer coefficient",":math:`KLa_{R7}`", "240", ":math:`\text{hr}^{-1}`"
    "Dissolved oxygen concentration at equilibrium",":math:`S_{O, eq}`", "8e-3", ":math:`\text{hr}^{-1}`"
+   "Maximum total suspended solids concentration", ":math:`TSS_{max}`", "0.03", ":math:`\text{kg/}\text{m}^3`"
+   "Maximum chemical oxygen demand", ":math:`COD_{max}`", "0.1", ":math:`\text{kg/}\text{m}^3`"
+   "Maximum total phosphorus concentration", ":math:`P_{max}`", "0.002", ":math:`\text{kg/}\text{m}^3`"
+   "Maximum total nitrogen concentration", ":math:`N_{max}`", "0.018", ":math:`\text{kg/}\text{m}^3`"
+   "Maximum 5-day biological oxygen demand", ":math:`BOD5_{max}`", "0.01", ":math:`\text{kg/}\text{m}^3`"
 
 Additional Constraints
 ----------------------
@@ -202,6 +207,11 @@ Additional Constraints
    "Reactor 5 mass transfer", ":math:`injection_{R5, S_{O2}} = KLa_{R5} * V_{R5} * (S_{O, eq} - S_{O, out})`"
    "Reactor 6 mass transfer", ":math:`injection_{R6, S_{O2}} = KLa_{R6} * V_{R6} * (S_{O, eq} - S_{O, out})`"
    "Reactor 7 mass transfer", ":math:`injection_{R7, S_{O2}} = KLa_{R7} * V_{R7} * (S_{O, eq} - S_{O, out})`"
+   "Total suspended solids concentration", ":math:`TSS_{out} <= TSS_{max}`"
+   "Chemical oxygen demand", ":math:`COD_{out} <= COD_{max}`"
+   "Total phosphorus concentration", ":math:`P_{out} <= P_{max}`"
+   "Total nitrogen concentration", ":math:`N_{out} <= N_{max}`"
+   "5-day biological oxygen demand", ":math:`BOD5_{out} <= BOD5_{max}`"
 
 Future Refinements
 ------------------

@@ -10,11 +10,16 @@
 # "https://github.com/watertap-org/watertap/"
 #################################################################################
 """
-Flowsheet example full Water Resource Recovery Facility
+Flowsheet example of full Water Resource Recovery Facility
 (WRRF; a.k.a., wastewater treatment plant) with ASM2d and ADM1 with P extension.
 
 The flowsheet follows the same formulation as benchmark simulation model no.2 (BSM2)
 but comprises different specifications for default values than BSM2.
+
+Reference:
+X. Flores-Alsina, K. Solon, C.K. Mbamba, S. Tait, K.V. Gernaey, U. Jeppsson, D.J. Batstone,
+Modelling phosphorus (P), sulfur (S) and iron (Fe) interactions for dynamic simulations of anaerobic digestion processes,
+Water Research. 95 (2016) 370-382. https://www.sciencedirect.com/science/article/pii/S0043135416301397
 """
 
 # Some more information about this module
@@ -45,6 +50,13 @@ from idaes.core.util.tables import (
     create_stream_table_dataframe,
     stream_table_dataframe_to_string,
 )
+from idaes.core.scaling.custom_scaler_base import (
+    CustomScalerBase,
+    ConstraintScalingScheme,
+)
+from idaes.core.scaling.autoscaling import AutoScaler
+from idaes.core.scaling.scaling_base import ScalerBase
+
 from watertap.unit_models.cstr_injection import CSTR_Injection
 from watertap.unit_models.clarifier import Clarifier
 from watertap.property_models.unit_specific.anaerobic_digestion.modified_adm1_properties import (
@@ -79,7 +91,6 @@ from watertap.unit_models.thickener import (
 
 from watertap.core.util.initialization import (
     check_solve,
-    assert_degrees_of_freedom,
     interval_initializer,
 )
 
@@ -89,13 +100,16 @@ from watertap.costing.unit_models.clarifier import (
     cost_primary_clarifier,
 )
 
+from idaes.core.util import DiagnosticsToolbox
+
 # Set up logger
 _log = idaeslog.getLogger(__name__)
 
 
-def main(bio_P=False):
+def main(bio_P=False, has_effluent_constraints=False, reactor_volume_equalities=False):
     m = build(bio_P=bio_P)
     set_operating_conditions(m)
+    set_scaling(m, bio_P=bio_P)
 
     for mx in m.fs.mixers:
         mx.pressure_equality_constraints[0.0, 2].deactivate()
@@ -131,15 +145,36 @@ def main(bio_P=False):
         fail_flag=True,
     )
 
-    add_costing(m)
+    if has_effluent_constraints:
+        # Re-solve with effluent violation constraints
+        setup_optimization(
+            m, reactor_volume_equalities=reactor_volume_equalities, bio_P=bio_P
+        )
+        results = solve(m)
+
+    add_costing(m, bio_P=bio_P)
     m.fs.costing.initialize()
 
     interval_initializer(m.fs.costing)
 
-    assert_degrees_of_freedom(m, 0)
-
     results = solve(m)
     pyo.assert_optimal_termination(results)
+
+    badly_scaled_var_list = iscale.badly_scaled_var_generator(m, large=1e2, small=1e-2)
+    print("----------------   badly_scaled_var_list   ----------------")
+    for x in badly_scaled_var_list:
+        print(f"{x[0].name}\t{x[0].value}\tsf: {iscale.get_scaling_factor(x[0])}")
+
+    dt = DiagnosticsToolbox(m)
+    print("---Numerical Issues---")
+    dt.report_numerical_issues()
+    dt.display_variables_with_extreme_jacobians()
+    dt.display_constraints_with_extreme_jacobians()
+    print("---SVD---")
+    svd = dt.prepare_svd_toolbox()
+    svd.display_underdetermined_variables_and_constraints()
+    # svd.display_constraints_including_variable(m.fs.CL.costing.capital_cost)
+    # svd.display_variables_in_constraint(m.fs.AD.unit_material_balance[0, "S_IC"])
 
     display_costing(m)
     display_performance_metrics(m)
@@ -526,34 +561,182 @@ def set_operating_conditions(m):
     m.fs.thickener.hydraulic_retention_time.fix(86400 * pyo.units.s)
     m.fs.thickener.diameter.fix(10 * pyo.units.m)
 
-    def scale_variables(m):
-        for var in m.fs.component_data_objects(pyo.Var, descend_into=True):
-            if "flow_vol" in var.name:
-                iscale.set_scaling_factor(var, 1e0)
-            if "temperature" in var.name:
-                iscale.set_scaling_factor(var, 1e-2)
-            if "pressure" in var.name:
-                iscale.set_scaling_factor(var, 1e-5)
-            if "conc_mass_comp" in var.name:
-                iscale.set_scaling_factor(var, 1e1)
+
+def set_scaling(m, bio_P=False):
+    csb = CustomScalerBase()
+    auto = AutoScaler()
+    sb = ScalerBase()
+
+    # Scale Arc constraints
+    stream_list = [
+        m.fs.stream2,
+        m.fs.stream3,
+        m.fs.stream4,
+        m.fs.stream5,
+        m.fs.stream6,
+        m.fs.stream7,
+        m.fs.stream8,
+        m.fs.stream9,
+        m.fs.stream10,
+        m.fs.stream11,
+        m.fs.stream12,
+        m.fs.stream13,
+        m.fs.stream14,
+        m.fs.stream15,
+        m.fs.stream16,
+        m.fs.stream_AD_translator,
+        m.fs.stream_SP_thickener,
+        m.fs.stream3adm,
+        m.fs.stream7adm,
+        m.fs.stream9adm,
+        m.fs.stream_translator_dewater,
+        m.fs.stream1a,
+        m.fs.stream1b,
+        m.fs.stream1c,
+        m.fs.stream_dewater_sludge,
+        m.fs.stream_dewater_mixer,
+        m.fs.stream10adm,
+        m.fs.stream_translator_AD,
+    ]
+
+    # for stream in stream_list:
+    #     for constraint in stream.component_data_objects(pyo.Constraint, descend_into=True):
+    #         csb.scale_constraint_by_nominal_value(
+    #             constraint,
+    #             scheme=ConstraintScalingScheme.inverseMaximum,
+    #             overwrite=True,
+    #         )
+    # iscale.constraint_scaling_transform(constraint, 1e9)
+    # auto.scale_constraints_by_jacobian_norm(constraint)
+
+    for var in m.fs.component_data_objects(pyo.Var, descend_into=True):
+        if "flow_vol" in var.name:
+            iscale.set_scaling_factor(var, 1e0)
+        if "temperature" in var.name:
+            iscale.set_scaling_factor(var, 1e-2)
+        if "pressure" in var.name:
+            iscale.set_scaling_factor(var, 1e-5)
+        if "conc_mass_comp" in var.name:
+            iscale.set_scaling_factor(var, 1e1)
 
     for unit in ("R1", "R2", "R3", "R4", "R5", "R6", "R7"):
         block = getattr(m.fs, unit)
-        iscale.set_scaling_factor(
-            block.control_volume.reactions[0.0].rate_expression, 1e3
-        )
+        if bio_P:
+            iscale.set_scaling_factor(
+                block.control_volume.reactions[0.0].rate_expression, 1e3
+            )
+        else:
+            iscale.set_scaling_factor(
+                block.control_volume.reactions[0.0].rate_expression, 1e4
+            )
         iscale.set_scaling_factor(block.cstr_performance_eqn, 1e3)
         iscale.set_scaling_factor(
             block.control_volume.rate_reaction_stoichiometry_constraint, 1e3
         )
         iscale.set_scaling_factor(block.control_volume.material_balances, 1e3)
 
+        # if unit in "R1":
+        #     iscale.set_scaling_factor(block.control_volume.reactions[0].reaction_rate, 1e7)
+
     iscale.set_scaling_factor(m.fs.AD.KH_co2, 1e1)
     iscale.set_scaling_factor(m.fs.AD.KH_ch4, 1e1)
-    iscale.set_scaling_factor(m.fs.AD.KH_h2, 1e1)
+    if bio_P:
+        iscale.set_scaling_factor(m.fs.AD.KH_h2, 1e2)
+    else:
+        iscale.set_scaling_factor(m.fs.AD.KH_h2, 1e1)  # or 1e4
+
+    # New scaling factors (may not include all of these)
+    if bio_P:
+        pass
+        # iscale.set_scaling_factor(m.fs.dewater.mixed_state[0].flow_vol, 1e2)
+    else:
+        iscale.set_scaling_factor(m.fs.dewater.mixed_state[0].flow_vol, 1e2)
+
+    iscale.set_scaling_factor(m.fs.AD.liquid_phase.heat[0], 1e3)  # or 1e2
+    if bio_P:
+        csb.scale_constraint_by_nominal_value(
+            m.fs.AD.liquid_phase.enthalpy_balances[0],
+            scheme=ConstraintScalingScheme.inverseMaximum,
+            overwrite=True,
+        )
+    else:
+        csb.scale_constraint_by_nominal_value(
+            m.fs.AD.liquid_phase.enthalpy_balances[0],
+            scheme=ConstraintScalingScheme.inverseMinimum,
+            overwrite=True,
+        )
+    # iscale.constraint_scaling_transform(m.fs.AD.liquid_phase.enthalpy_balances[0], 1e-3)
+
+    csb.scale_constraint_by_nominal_value(
+        m.fs.AD.flow_vol_vap[0],
+        scheme=ConstraintScalingScheme.inverseMaximum,
+        overwrite=True,
+    )
+
+    # csb.scale_constraint_by_nominal_value(
+    #     m.fs.AD.liquid_phase.reactions[0].rate_expression["R24"],
+    #     scheme=ConstraintScalingScheme.inverseMinimum,
+    #     overwrite=True,
+    # )
+    # iscale.constraint_scaling_transform(m.fs.AD.liquid_phase.reactions[0].rate_expression["R24"], 1e5)
+
+    # iscale.set_scaling_factor(m.fs.AD.AD_retention_time[0], 1e0)
+    if bio_P:
+        pass
+        # iscale.constraint_scaling_transform(m.fs.AD.AD_retention_time[0], 1e-6)
+    else:
+        iscale.constraint_scaling_transform(m.fs.AD.AD_retention_time[0], 1e-6)
+
+    # csb.scale_constraint_by_nominal_value(
+    #     m.fs.MX3.enthalpy_mixing_equations[0],
+    #     scheme=ConstraintScalingScheme.inverseMinimum,
+    #     overwrite=True,
+    # )
+
+    if bio_P:
+        iscale.set_scaling_factor(m.fs.AD.liquid_phase.reactions[0].S_H, 1e7)
+        csb.scale_constraint_by_nominal_value(
+            m.fs.AD.unit_material_balance[0, "X_su"],
+            scheme=ConstraintScalingScheme.inverseMaximum,
+            overwrite=True,
+        )
+        # iscale.set_scaling_factor(m.fs.AD.liquid_phase.mass_transfer_term[0, "Liq", "H2O"], 1e2)
+        # csb.scale_constraint_by_nominal_value(
+        #     m.fs.translator_asm2d_adm1.eq_flow_vol_rule[0], scheme=ConstraintScalingScheme.inverseMaximum, overwrite=True
+        # )
+        # csb.scale_constraint_by_nominal_value(
+        #     m.fs.AD.unit_material_balance[0, "X_su"], scheme=ConstraintScalingScheme.inverseMaximum, overwrite=True
+        # )
+    else:
+        iscale.set_scaling_factor(m.fs.AD.liquid_phase.reactions[0].S_H, 1e8)
+        csb.scale_constraint_by_nominal_value(
+            m.fs.translator_asm2d_adm1.eq_flow_vol_rule[0],
+            scheme=ConstraintScalingScheme.harmonicMean,
+            overwrite=True,
+        )
+    # iscale.set_scaling_factor(m.fs.AD.liquid_phase.mass_transfer_term[0, "Liq", "H2O"], 1e5)
+    # iscale.set_scaling_factor(m.fs.AD.liquid_phase.reactions[0].I["R6"], 1e4)
+    # iscale.set_scaling_factor(m.fs.AD.liquid_phase.reactions[0].I["R9"], 1e4)
+
+    # auto.scale_constraints_by_jacobian_norm(m.fs.translator_asm2d_adm1.eq_flow_vol_rule[0])
+    # csb.scale_constraint_by_nominal_value(
+    #     m.fs.translator_asm2d_adm1.eq_flow_vol_rule[0], scheme=ConstraintScalingScheme.harmonicMean, overwrite=True
+    # )
+    # csb.scale_constraint_by_nominal_value(
+    #     m.fs.AD.liquid_phase.material_balances[0, "Liq", "H2O"], scheme=ConstraintScalingScheme.inverseSum, overwrite=True
+    # )
+    # csb.scale_constraint_by_nominal_value(
+    #     m.fs.AD.unit_material_balance[0, "X_su"], scheme=ConstraintScalingScheme.inverseMinimum, overwrite=True
+    # )
+    # csb.scale_constraint_by_nominal_value(
+    #     m.fs.AD.unit_material_balance[0, "S_IC"], scheme=ConstraintScalingScheme.inverseSum, overwrite=True
+    # )
+
+    # iscale.set_scaling_factor(m.fs.AD.liquid_phase.rate_reaction_generation, 1e3)   # 1e2 or 1e3
+    # iscale.set_scaling_factor(m.fs.AD.liquid_phase.mass_transfer_term, 1e5)
+    # auto.scale_variables_by_magnitude(m.fs.AD.liquid_phase.mass_transfer_term)
 
     # Apply scaling
-    scale_variables(m)
     iscale.calculate_scaling_factors(m)
 
 
@@ -683,7 +866,32 @@ def initialize_system(m, bio_P=False, solver=None):
     seq.set_guesses_for(m.fs.translator_asm2d_adm1.inlet, tear_guesses2)
 
     def function(unit):
-        unit.initialize(outlvl=idaeslog.INFO, solver="ipopt-watertap")
+        if unit == m.fs.AD:
+            try:
+                unit.initialize(outlvl=idaeslog.INFO, solver="ipopt-watertap")
+            except:
+                print("Default initialization of AD failed")
+                # Fix feed states
+                m.fs.AD.inlet.flow_vol.fix()
+                m.fs.AD.inlet.conc_mass_comp.fix()
+                m.fs.AD.inlet.temperature.fix()
+                m.fs.AD.inlet.pressure.fix()
+                m.fs.AD.volume_vapor.fix()
+                m.fs.AD.volume_liquid.fix()
+                m.fs.AD.liquid_outlet.temperature.fix()
+                # Re-solve unit
+                solver = get_solver()
+                solver.solve(m.fs.AD, tee=True)
+                # Unfix feed states
+                m.fs.AD.inlet.flow_vol.unfix()
+                m.fs.AD.inlet.conc_mass_comp.unfix()
+                m.fs.AD.inlet.temperature.unfix()
+                m.fs.AD.inlet.pressure.unfix()
+                m.fs.AD.volume_vapor.unfix()
+                m.fs.AD.volume_liquid.unfix()
+                m.fs.AD.liquid_outlet.temperature.unfix()
+        else:
+            unit.initialize(outlvl=idaeslog.INFO, solver="ipopt-watertap")
 
     seq.run(m, function)
 
@@ -697,7 +905,167 @@ def solve(m, solver=None):
     return results
 
 
-def add_costing(m):
+def setup_optimization(m, reactor_volume_equalities=False, bio_P=False):
+
+    for i in ["R1", "R2", "R3", "R4", "R5", "R6", "R7"]:
+        reactor = getattr(m.fs, i)
+        reactor.volume.unfix()
+        reactor.volume.setlb(1)
+        # reactor.volume.setub(2000)
+    if reactor_volume_equalities:
+        add_reactor_volume_equalities(m)
+
+    m.fs.R5.outlet.conc_mass_comp[:, "S_O2"].unfix()
+    m.fs.R5.outlet.conc_mass_comp[:, "S_O2"].setub(1e-2)
+
+    m.fs.R6.outlet.conc_mass_comp[:, "S_O2"].unfix()
+    m.fs.R6.outlet.conc_mass_comp[:, "S_O2"].setub(1e-2)
+
+    m.fs.R7.outlet.conc_mass_comp[:, "S_O2"].unfix()
+    m.fs.R7.outlet.conc_mass_comp[:, "S_O2"].setub(1e-2)
+
+    # Unfix fraction of outflow from reactor 7 that goes to recycle
+    m.fs.SP1.split_fraction[:, "underflow"].unfix()
+    # m.fs.SP1.split_fraction[:, "underflow"].setlb(0.45)
+    m.fs.SP2.split_fraction[:, "recycle"].unfix()
+
+    add_effluent_violations(m, bio_P=bio_P)
+
+
+def add_reactor_volume_equalities(m):
+    # TODO: These constraints were applied for initial optimization of AS reactor volumes; otherwise, volumes drive towards lower bound. Revisit
+    @m.fs.Constraint(m.fs.time)
+    def Vol_1(self, t):
+        return m.fs.R1.volume[0] == m.fs.R2.volume[0]
+
+    @m.fs.Constraint(m.fs.time)
+    def Vol_2(self, t):
+        return m.fs.R3.volume[0] == m.fs.R4.volume[0]
+
+    @m.fs.Constraint(m.fs.time)
+    def Vol_3(self, t):
+        return m.fs.R5.volume[0] == m.fs.R6.volume[0]
+
+    @m.fs.Constraint(m.fs.time)
+    def Vol_4(self, t):
+        return m.fs.R7.volume[0] >= m.fs.R6.volume[0] * 0.5
+
+
+def add_effluent_violations(m, bio_P=False):
+
+    m.fs.TSS_max = pyo.Var(initialize=0.03, units=pyo.units.kg / pyo.units.m**3)
+    m.fs.TSS_max.fix()
+
+    m.fs.eq_tss_max = pyo.Constraint(
+        expr=m.fs.Treated.properties[0].TSS <= m.fs.TSS_max
+    )
+
+    m.fs.COD_max = pyo.Var(initialize=0.1, units=pyo.units.kg / pyo.units.m**3)
+    m.fs.COD_max.fix()
+
+    m.fs.eq_cod_max = pyo.Constraint(
+        expr=m.fs.Treated.properties[0].COD <= m.fs.COD_max
+    )
+
+    m.fs.total_N_max = pyo.Var(initialize=0.018, units=pyo.units.kg / pyo.units.m**3)
+    m.fs.total_N_max.fix()
+
+    m.fs.eq_total_N_max = pyo.Constraint(
+        expr=m.fs.Treated.properties[0].TKN + m.fs.Treated.properties[0].SNOX
+        <= m.fs.total_N_max
+    )
+
+    m.fs.BOD5_max = pyo.Var(initialize=0.01, units=pyo.units.kg / pyo.units.m**3)
+    m.fs.BOD5_max.fix()
+
+    m.fs.eq_BOD5_max = pyo.Constraint(
+        expr=m.fs.Treated.properties[0].BOD5["effluent"] <= m.fs.BOD5_max
+    )
+
+    # Effluent phosphorus constraint is too stringent
+    # This constraint was violated 100% of the operating time in the Flores-Alsina simulation
+    # m.fs.total_P_max = pyo.Var(initialize=0.002, units=pyo.units.kg / pyo.units.m**3)
+    # m.fs.total_P_max.fix()
+    #
+    # m.fs.eq_total_P_max = pyo.Constraint(
+    #     expr=m.fs.Treated.properties[0].SP_organic + m.fs.Treated.properties[0].SP_inorganic <= m.fs.total_P_max
+    # )
+
+    csb = CustomScalerBase()
+
+    if bio_P:
+        # csb.scale_constraint_by_nominal_value(
+        #     m.fs.eq_tss_max,
+        #     scheme=ConstraintScalingScheme.inverseMaximum,
+        #     overwrite=True
+        # )
+        # csb.scale_constraint_by_nominal_value(
+        #     m.fs.eq_cod_max,
+        #     scheme=ConstraintScalingScheme.inverseMaximum,
+        #     overwrite=True
+        # )
+        # csb.scale_constraint_by_nominal_value(
+        #     m.fs.eq_total_N_max,
+        #     scheme=ConstraintScalingScheme.inverseMaximum,
+        #     overwrite=True
+        # )
+        # csb.scale_constraint_by_nominal_value(
+        #     m.fs.eq_BOD5_max,
+        #     scheme=ConstraintScalingScheme.inverseMaximum,
+        #     overwrite=True
+        # )
+        # -------------------------------------------------------------------------
+
+        iscale.constraint_scaling_transform(m.fs.eq_tss_max, 1e2)
+        iscale.constraint_scaling_transform(m.fs.eq_cod_max, 1e0)
+        iscale.constraint_scaling_transform(m.fs.eq_total_N_max, 1e1)
+        iscale.constraint_scaling_transform(m.fs.eq_BOD5_max, 1e3)
+    else:
+        csb.scale_constraint_by_nominal_value(
+            m.fs.eq_tss_max, scheme=ConstraintScalingScheme.inverseSum, overwrite=True
+        )
+        csb.scale_constraint_by_nominal_value(
+            m.fs.eq_cod_max, scheme=ConstraintScalingScheme.inverseRSS, overwrite=True
+        )
+        csb.scale_constraint_by_nominal_value(
+            m.fs.eq_total_N_max,
+            scheme=ConstraintScalingScheme.inverseRSS,
+            overwrite=True,
+        )
+        csb.scale_constraint_by_nominal_value(
+            m.fs.eq_BOD5_max, scheme=ConstraintScalingScheme.inverseRSS, overwrite=True
+        )
+        # -----------------------------------------------------------------------------------------------
+
+        # sb.set_constraint_scaling_factor(
+        #     m.fs.eq_tss_max,
+        #     scaling_factor=2.4266924637229854,
+        #     overwrite=True
+        # )
+        # sb.set_constraint_scaling_factor(
+        #     m.fs.eq_cod_max,
+        #     scaling_factor=3.1622776601683786,
+        #     overwrite=True
+        # )
+        # sb.set_constraint_scaling_factor(
+        #     m.fs.eq_total_N_max,
+        #     scaling_factor=6.9603734991178206,
+        #     overwrite=True
+        # )
+        # sb.set_constraint_scaling_factor(
+        #     m.fs.eq_BOD5_max,
+        #     scaling_factor=14.907119849998594,
+        #     overwrite=True
+        # )
+        # ------------------------------------------------------------------------------
+
+        # iscale.constraint_scaling_transform(m.fs.eq_tss_max, 1e1)
+        # iscale.constraint_scaling_transform(m.fs.eq_cod_max, 1e1)
+        # iscale.constraint_scaling_transform(m.fs.eq_total_N_max, 1)
+        # iscale.constraint_scaling_transform(m.fs.eq_BOD5_max, 1e2)
+
+
+def add_costing(m, bio_P=False):
     m.fs.costing = WaterTAPCosting()
     m.fs.costing.base_currency = pyo.units.USD_2020
 
@@ -732,11 +1100,43 @@ def add_costing(m):
     m.fs.costing.add_specific_energy_consumption(m.fs.FeedWater.properties[0].flow_vol)
 
     m.fs.objective = pyo.Objective(expr=m.fs.costing.LCOW)
-    iscale.set_scaling_factor(m.fs.costing.total_capital_cost, 1e-5)
+    iscale.set_scaling_factor(m.fs.costing.total_capital_cost, 1e-7)
+    # iscale.set_scaling_factor(m.fs.costing.aggregate_capital_cost, 1e-7)
+    # iscale.set_scaling_factor(m.fs.costing.aggregate_flow_electricity, 1e-4)
+    # iscale.set_scaling_factor(m.fs.costing.aggregate_flow_costs["electricity"], 1e-5)
+    # iscale.set_scaling_factor(m.fs.costing.total_operating_cost, 1e-5)
 
     for block in m.fs.component_objects(pyo.Block, descend_into=True):
         if isinstance(block, UnitModelBlockData) and hasattr(block, "costing"):
             iscale.set_scaling_factor(block.costing.capital_cost, 1e-5)
+
+    csb = CustomScalerBase()
+
+    # csb.scale_constraint_by_nominal_value(
+    #     m.fs.dewater.costing.capital_cost_constraint,
+    #     scheme=ConstraintScalingScheme.inverseMinimum,
+    #     overwrite=True,
+    # )
+    if bio_P:
+        iscale.constraint_scaling_transform(
+            m.fs.AD.costing.capital_cost_constraint, 1e-6
+        )
+        # iscale.constraint_scaling_transform(m.fs.dewater.costing.capital_cost_constraint, 1e-7)
+        # csb.scale_constraint_by_nominal_value(
+        #     m.fs.dewater.costing.capital_cost_constraint, scheme=ConstraintScalingScheme.inverseSum, overwrite=True
+        # )
+        # iscale.constraint_scaling_transform(m.fs.CL.costing.capital_cost_constraint, 1e-6)
+    else:
+        iscale.constraint_scaling_transform(
+            m.fs.dewater.costing.capital_cost_constraint, 1e-6
+        )
+        iscale.constraint_scaling_transform(
+            m.fs.AD.costing.capital_cost_constraint, 1e-6
+        )
+    # iscale.constraint_scaling_transform(m.fs.CL.costing.capital_cost_constraint, 1e-6)
+
+    # iscale.set_scaling_factor(m.fs.CL.costing.capital_cost, 1e-6)
+    # iscale.set_scaling_factor(m.fs.AD.costing.capital_cost, 1e-6)
 
 
 def display_costing(m):
@@ -903,6 +1303,11 @@ def display_performance_metrics(m):
         pyo.units.get_units(m.fs.FeedWater.properties[0].SNOX),
     )
     print(
+        "Total nitrogen concentration",
+        pyo.value(m.fs.FeedWater.properties[0].TKN + m.fs.FeedWater.properties[0].SNOX),
+        pyo.units.get_units(m.fs.FeedWater.properties[0].SNOX),
+    )
+    print(
         "Organic phosphorus concentration",
         pyo.value(m.fs.FeedWater.properties[0].SP_organic),
         pyo.units.get_units(m.fs.FeedWater.properties[0].SP_organic),
@@ -911,6 +1316,14 @@ def display_performance_metrics(m):
         "Inorganic phosphorus concentration",
         pyo.value(m.fs.FeedWater.properties[0].SP_inorganic),
         pyo.units.get_units(m.fs.FeedWater.properties[0].SP_inorganic),
+    )
+    print(
+        "Total phosphorus concentration",
+        pyo.value(
+            m.fs.FeedWater.properties[0].SP_organic
+            + m.fs.FeedWater.properties[0].SP_inorganic
+        ),
+        pyo.units.get_units(m.fs.FeedWater.properties[0].SP_organic),
     )
 
     print("---- Effluent Metrics----")
@@ -940,6 +1353,11 @@ def display_performance_metrics(m):
         pyo.units.get_units(m.fs.Treated.properties[0].SNOX),
     )
     print(
+        "Total nitrogen concentration",
+        pyo.value(m.fs.Treated.properties[0].TKN + m.fs.Treated.properties[0].SNOX),
+        pyo.units.get_units(m.fs.Treated.properties[0].SNOX),
+    )
+    print(
         "Organic phosphorus concentration",
         pyo.value(m.fs.Treated.properties[0].SP_organic),
         pyo.units.get_units(m.fs.Treated.properties[0].SP_organic),
@@ -949,10 +1367,18 @@ def display_performance_metrics(m):
         pyo.value(m.fs.Treated.properties[0].SP_inorganic),
         pyo.units.get_units(m.fs.Treated.properties[0].SP_inorganic),
     )
+    print(
+        "Total phosphorus concentration",
+        pyo.value(
+            m.fs.Treated.properties[0].SP_organic
+            + m.fs.Treated.properties[0].SP_inorganic
+        ),
+        pyo.units.get_units(m.fs.Treated.properties[0].SP_organic),
+    )
 
 
 if __name__ == "__main__":
-    m, results = main(bio_P=False)
+    m, results = main(bio_P=False, has_effluent_constraints=True)
 
     stream_table = create_stream_table_dataframe(
         {
@@ -974,3 +1400,8 @@ if __name__ == "__main__":
         time_point=0,
     )
     print(stream_table_dataframe_to_string(stream_table))
+
+    # constraint_sf = iscale.get_scaling_factor(m.fs.eq_tss_max)
+    # constraint_value = pyo.value(m.fs.eq_tss_max)
+    # print(f"Constraint value is: {constraint_value}")
+    # print(f"Constraint scaling factor is: {constraint_sf}")
