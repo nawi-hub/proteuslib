@@ -117,6 +117,7 @@ def build():
 
 class TestClarifier(UnitTestHarness):
     def configure(self):
+        self.default_small = 1e-08
         m = build()
 
         self.unit_solutions[m.fs.unit.underflow.conc_mass_comp[0, "S_I"]] = 0.027
@@ -200,6 +201,7 @@ class TestClarifier(UnitTestHarness):
 
 class TestCircularCosting(UnitTestHarness):
     def configure(self):
+        self.default_small = 1e-08
         m = build()
 
         # Add unit model costing
@@ -228,6 +230,7 @@ class TestCircularCosting(UnitTestHarness):
 
 class TestRectangularCosting(UnitTestHarness):
     def configure(self):
+        self.default_small = 1e-08
         m = build()
 
         # Add unit model costing
@@ -257,6 +260,7 @@ class TestRectangularCosting(UnitTestHarness):
 
 class TestPrimaryClarifierCosting(UnitTestHarness):
     def configure(self):
+        self.default_small = 1e-08
         m = build()
 
         # Add unit model costing

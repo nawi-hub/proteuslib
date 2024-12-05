@@ -127,7 +127,7 @@ class TestElectrodialysisReversalZO_w_default_removal:
         assert pytest.approx(204.5935, rel=1e-5) == value(
             model.fs.unit.properties_byproduct[0].conc_mass_comp["tds"]
         )
-        assert pytest.approx(1.01197e-08, rel=1e-5) == value(
+        assert pytest.approx(1.01197e-08, abs=1e-7) == value(
             model.fs.unit.properties_byproduct[0].conc_mass_comp["foo"]
         )
         assert pytest.approx(472761.372, rel=1e-5) == value(

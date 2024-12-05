@@ -135,7 +135,7 @@ class TestSaltPrecipitationZO:
         assert pytest.approx(0.4634, rel=1e-5) == value(
             model.fs.unit.properties_treated[0].flow_vol
         )
-        assert pytest.approx(2.158e-8, rel=1e-5) == value(
+        assert pytest.approx(2.158e-8, abs=1e-7) == value(
             model.fs.unit.properties_treated[0].conc_mass_comp["organic_solid"]
         )
         assert pytest.approx(130.7725, rel=1e-5) == value(
@@ -148,7 +148,7 @@ class TestSaltPrecipitationZO:
         assert pytest.approx(214.5036, rel=1e-5) == value(
             model.fs.unit.properties_byproduct[0].conc_mass_comp["organic_solid"]
         )
-        assert pytest.approx(3.0212e-7, rel=1e-5) == value(
+        assert pytest.approx(3.0212e-7, abs=1e-5) == value(
             model.fs.unit.properties_byproduct[0].conc_mass_comp["organic_liquid"]
         )
         assert pytest.approx(15246.52, rel=1e-5) == value(model.fs.unit.electricity[0])

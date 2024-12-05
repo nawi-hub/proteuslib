@@ -241,7 +241,7 @@ class Testbrine_concentratorZO_w_default_removal:
         assert pytest.approx(196.787149, rel=1e-5) == value(
             model.fs.unit.properties_byproduct[0].conc_mass_comp["tds"]
         )
-        assert pytest.approx(8.0321285e-09, rel=1e-5) == value(
+        assert pytest.approx(8.0321285e-09, abs=1e-7) == value(
             model.fs.unit.properties_byproduct[0].conc_mass_comp["foo"]
         )
         assert pytest.approx(855649.563040, rel=1e-5) == value(

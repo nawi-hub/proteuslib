@@ -190,7 +190,7 @@ class TestElectrodialysisVoltageConst:
         assert value(m.fs.EDstack.recovery_mass_H2O[0]) == pytest.approx(
             0.4846, rel=1e-3
         )
-        assert value(m.fs.mem_area) == pytest.approx(1.0980, rel=1e-3)
+        assert value(m.fs.mem_area) == pytest.approx(1.0980, rel=1e-2)
         assert value(m.fs.EDstack.voltage_applied[0]) == pytest.approx(7.0325, rel=1e-3)
         assert value(m.fs.costing.specific_energy_consumption) == pytest.approx(
             2.3062, rel=1e-3

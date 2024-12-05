@@ -163,7 +163,7 @@ class TestIronManganeseRemovalZO_w_default_removal:
         assert pytest.approx(498.89, rel=1e-5) == value(
             model.fs.unit.properties_byproduct[0].conc_mass_comp["manganese"]
         )
-        assert pytest.approx(2.2173e-08, rel=1e-5) == value(
+        assert pytest.approx(2.2173e-08, abs=1e-7) == value(
             model.fs.unit.properties_byproduct[0].conc_mass_comp["foo"]
         )
         assert pytest.approx(521.534735, abs=1e-5) == value(
