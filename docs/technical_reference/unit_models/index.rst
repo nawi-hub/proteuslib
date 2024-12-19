@@ -6,6 +6,7 @@ Unit Models
 
    anaerobic_digester
    aeration_tank
+   bipolar_electrodialysis_0D
    boron_removal
    clarifier
    coag_floc_model
