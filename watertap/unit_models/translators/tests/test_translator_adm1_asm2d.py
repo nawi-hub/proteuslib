@@ -22,6 +22,8 @@ from pyomo.environ import (
     ConcreteModel,
     value,
     assert_optimal_termination,
+    Suffix,
+    TransformationFactory,
 )
 
 from idaes.core import (
@@ -39,18 +41,26 @@ from idaes.core.util.model_statistics import (
     number_total_constraints,
     number_unused_variables,
 )
+from idaes.core.util.scaling import (
+    get_jacobian,
+    jacobian_cond,
+)
+import idaes.core.util.scaling as iscale
 
 from idaes.core.util.testing import initialization_tester
 
 from watertap.unit_models.translators.translator_adm1_asm2d import (
     Translator_ADM1_ASM2D,
+    ADM1ASM2dScaler,
 )
 from watertap.property_models.unit_specific.anaerobic_digestion.modified_adm1_properties import (
     ModifiedADM1ParameterBlock,
+    ModifiedADM1PropertiesScaler,
 )
 
 from watertap.property_models.unit_specific.activated_sludge.modified_asm2d_properties import (
     ModifiedASM2dParameterBlock,
+    ModifiedASM2dPropertiesScaler,
 )
 
 from watertap.property_models.unit_specific.anaerobic_digestion.modified_adm1_reactions import (
@@ -323,4 +333,304 @@ class TestAdm1Asm2d(object):
                 )
             )
             <= 1e-6
+        )
+
+
+class TestADM1ASM2dScaler:
+    @pytest.fixture
+    def model(self):
+        m = ConcreteModel()
+
+        m.fs = FlowsheetBlock(dynamic=False)
+
+        m.fs.props_ASM2D = ModifiedASM2dParameterBlock()
+        m.fs.ASM2d_rxn_props = ModifiedASM2dReactionParameterBlock(
+            property_package=m.fs.props_ASM2D
+        )
+        m.fs.props_ADM1 = ModifiedADM1ParameterBlock()
+        m.fs.ADM1_rxn_props = ModifiedADM1ReactionParameterBlock(
+            property_package=m.fs.props_ADM1
+        )
+
+        m.fs.unit = Translator_ADM1_ASM2D(
+            inlet_property_package=m.fs.props_ADM1,
+            outlet_property_package=m.fs.props_ASM2D,
+            inlet_reaction_package=m.fs.ADM1_rxn_props,
+            outlet_reaction_package=m.fs.ASM2d_rxn_props,
+            has_phase_equilibrium=False,
+            outlet_state_defined=True,
+        )
+
+        m.fs.unit.inlet.flow_vol.fix(170 * units.m**3 / units.day)
+        m.fs.unit.inlet.temperature.fix(308.15 * units.K)
+        m.fs.unit.inlet.pressure.fix(1 * units.atm)
+
+        m.fs.unit.inlet.conc_mass_comp[0, "S_su"].fix(0.034597)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_aa"].fix(0.015037)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_fa"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_va"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_bu"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_pro"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ac"].fix(0.025072)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_h2"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ch4"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_IC"].fix(0.34628)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_IN"].fix(0.60014)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_IP"].fix(0.22677)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(0.026599)
+
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ch"].fix(7.3687)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_pr"].fix(7.7308)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_li"].fix(10.3288)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_su"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_aa"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_fa"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_c4"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_pro"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ac"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_h2"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_I"].fix(12.7727)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_PHA"].fix(0.0022493)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_PP"].fix(1.04110)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_PAO"].fix(3.4655)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_K"].fix(0.02268)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_Mg"].fix(0.02893)
+
+        m.fs.unit.inlet.cations[0].fix(0.04)
+        m.fs.unit.inlet.anions[0].fix(0.02)
+
+        return m
+
+    @pytest.mark.component
+    def test_variable_scaling_routine(self, model):
+        scaler = model.fs.unit.default_scaler()
+
+        assert isinstance(scaler, ADM1ASM2dScaler)
+
+        scaler.variable_scaling_routine(model.fs.unit)
+
+        # Inlet state
+        sfx_in = model.fs.unit.properties_in[0].scaling_factor
+        assert isinstance(sfx_in, Suffix)
+        assert len(sfx_in) == 3
+        assert sfx_in[model.fs.unit.properties_in[0].flow_vol] == pytest.approx(
+            1e5, rel=1e-8
+        )
+        assert sfx_in[model.fs.unit.properties_in[0].pressure] == pytest.approx(
+            1e-6, rel=1e-8
+        )
+        assert sfx_in[model.fs.unit.properties_in[0].temperature] == pytest.approx(
+            1e-1, rel=1e-8
+        )
+
+        # Outlet state - should be the same as the inlet
+        sfx_out = model.fs.unit.properties_out[0].scaling_factor
+        assert isinstance(sfx_out, Suffix)
+        assert len(sfx_out) == 3
+        assert sfx_out[model.fs.unit.properties_out[0].flow_vol] == pytest.approx(
+            1e5, rel=1e-8
+        )
+        assert sfx_out[model.fs.unit.properties_out[0].pressure] == pytest.approx(
+            1e-5, rel=1e-8
+        )
+        assert sfx_out[model.fs.unit.properties_out[0].temperature] == pytest.approx(
+            1e-2, rel=1e-8
+        )
+
+    @pytest.mark.component
+    def test_constraint_scaling_routine(self, model):
+        scaler = model.fs.unit.default_scaler()
+
+        assert isinstance(scaler, ADM1ASM2dScaler)
+
+        scaler.constraint_scaling_routine(model.fs.unit)
+
+        sfx_out = model.fs.unit.properties_out[0].scaling_factor
+        assert isinstance(sfx_out, Suffix)
+        assert len(sfx_out) == 1
+
+    @pytest.mark.component
+    def test_scale_model(self, model):
+        scaler = model.fs.unit.default_scaler()
+
+        assert isinstance(scaler, ADM1ASM2dScaler)
+
+        scaler.scale_model(model.fs.unit)
+
+        # Inlet state
+        sfx_in = model.fs.unit.properties_in[0].scaling_factor
+        assert isinstance(sfx_in, Suffix)
+        assert len(sfx_in) == 3
+        assert sfx_in[model.fs.unit.properties_in[0].flow_vol] == pytest.approx(
+            1e5, rel=1e-8
+        )
+        assert sfx_in[model.fs.unit.properties_in[0].pressure] == pytest.approx(
+            1e-6, rel=1e-8
+        )
+        assert sfx_in[model.fs.unit.properties_in[0].temperature] == pytest.approx(
+            1e-1, rel=1e-8
+        )
+
+        # Outlet state - should be the same as the inlet
+        sfx_out = model.fs.unit.properties_out[0].scaling_factor
+        assert isinstance(sfx_out, Suffix)
+        assert len(sfx_out) == 3
+        assert sfx_out[model.fs.unit.properties_out[0].flow_vol] == pytest.approx(
+            1e5, rel=1e-8
+        )
+        assert sfx_out[model.fs.unit.properties_out[0].pressure] == pytest.approx(
+            1e-5, rel=1e-8
+        )
+        assert sfx_out[model.fs.unit.properties_out[0].temperature] == pytest.approx(
+            1e-2, rel=1e-8
+        )
+
+    # TODO: Remove test once iscale is deprecated
+    @pytest.mark.integration
+    def test_example_case_iscale(self):
+        m = ConcreteModel()
+
+        m.fs = FlowsheetBlock(dynamic=False)
+
+        m.fs.props_ASM2D = ModifiedASM2dParameterBlock()
+        m.fs.ASM2d_rxn_props = ModifiedASM2dReactionParameterBlock(
+            property_package=m.fs.props_ASM2D
+        )
+        m.fs.props_ADM1 = ModifiedADM1ParameterBlock()
+        m.fs.ADM1_rxn_props = ModifiedADM1ReactionParameterBlock(
+            property_package=m.fs.props_ADM1
+        )
+
+        m.fs.unit = Translator_ADM1_ASM2D(
+            inlet_property_package=m.fs.props_ADM1,
+            outlet_property_package=m.fs.props_ASM2D,
+            inlet_reaction_package=m.fs.ADM1_rxn_props,
+            outlet_reaction_package=m.fs.ASM2d_rxn_props,
+            has_phase_equilibrium=False,
+            outlet_state_defined=True,
+        )
+
+        m.fs.unit.inlet.flow_vol.fix(170 * units.m**3 / units.day)
+        m.fs.unit.inlet.temperature.fix(308.15 * units.K)
+        m.fs.unit.inlet.pressure.fix(1 * units.atm)
+
+        m.fs.unit.inlet.conc_mass_comp[0, "S_su"].fix(0.034597)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_aa"].fix(0.015037)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_fa"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_va"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_bu"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_pro"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ac"].fix(0.025072)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_h2"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ch4"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_IC"].fix(0.34628)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_IN"].fix(0.60014)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_IP"].fix(0.22677)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(0.026599)
+
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ch"].fix(7.3687)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_pr"].fix(7.7308)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_li"].fix(10.3288)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_su"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_aa"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_fa"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_c4"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_pro"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ac"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_h2"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_I"].fix(12.7727)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_PHA"].fix(0.0022493)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_PP"].fix(1.04110)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_PAO"].fix(3.4655)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_K"].fix(0.02268)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_Mg"].fix(0.02893)
+
+        m.fs.unit.inlet.cations[0].fix(0.04)
+        m.fs.unit.inlet.anions[0].fix(0.02)
+
+        iscale.calculate_scaling_factors(m.fs.unit)
+
+        # Check condition number to confirm scaling
+        sm = TransformationFactory("core.scale_model").create_using(m, rename=False)
+        jac, _ = get_jacobian(sm, scaled=False)
+        assert (jacobian_cond(jac=jac, scaled=False)) == pytest.approx(
+            4.47213596e5, rel=1e-3
+        )
+
+    @pytest.mark.integration
+    def test_example_case_scaler(self):
+        m = ConcreteModel()
+
+        m.fs = FlowsheetBlock(dynamic=False)
+
+        m.fs.props_ASM2D = ModifiedASM2dParameterBlock()
+        m.fs.ASM2d_rxn_props = ModifiedASM2dReactionParameterBlock(
+            property_package=m.fs.props_ASM2D
+        )
+        m.fs.props_ADM1 = ModifiedADM1ParameterBlock()
+        m.fs.ADM1_rxn_props = ModifiedADM1ReactionParameterBlock(
+            property_package=m.fs.props_ADM1
+        )
+
+        m.fs.unit = Translator_ADM1_ASM2D(
+            inlet_property_package=m.fs.props_ADM1,
+            outlet_property_package=m.fs.props_ASM2D,
+            inlet_reaction_package=m.fs.ADM1_rxn_props,
+            outlet_reaction_package=m.fs.ASM2d_rxn_props,
+            has_phase_equilibrium=False,
+            outlet_state_defined=True,
+        )
+
+        m.fs.unit.inlet.flow_vol.fix(170 * units.m**3 / units.day)
+        m.fs.unit.inlet.temperature.fix(308.15 * units.K)
+        m.fs.unit.inlet.pressure.fix(1 * units.atm)
+
+        m.fs.unit.inlet.conc_mass_comp[0, "S_su"].fix(0.034597)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_aa"].fix(0.015037)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_fa"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_va"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_bu"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_pro"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ac"].fix(0.025072)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_h2"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ch4"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_IC"].fix(0.34628)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_IN"].fix(0.60014)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_IP"].fix(0.22677)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(0.026599)
+
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ch"].fix(7.3687)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_pr"].fix(7.7308)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_li"].fix(10.3288)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_su"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_aa"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_fa"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_c4"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_pro"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ac"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_h2"].fix(0)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_I"].fix(12.7727)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_PHA"].fix(0.0022493)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_PP"].fix(1.04110)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_PAO"].fix(3.4655)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_K"].fix(0.02268)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_Mg"].fix(0.02893)
+
+        m.fs.unit.inlet.cations[0].fix(0.04)
+        m.fs.unit.inlet.anions[0].fix(0.02)
+
+        scaler = ADM1ASM2dScaler()
+        scaler.scale_model(
+            m.fs.unit,
+            submodel_scalers={
+                m.fs.unit.properties_in: ModifiedADM1PropertiesScaler,
+                m.fs.unit.properties_out: ModifiedASM2dPropertiesScaler,
+            },
+        )
+
+        # Check condition number to confirm scaling
+        sm = TransformationFactory("core.scale_model").create_using(m, rename=False)
+        jac, _ = get_jacobian(sm, scaled=False)
+        assert (jacobian_cond(jac=jac, scaled=False)) == pytest.approx(
+            7.180968e3, rel=1e-3
         )
