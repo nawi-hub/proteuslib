@@ -50,6 +50,11 @@ _log = idaeslog.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------
+class CPHSDMCalculationMethod(Enum):
+    input = auto()  # calculate CPHSDM model by inputting empirical parameters
+    surrogate = auto()  # calculate CPHSDM model using pre-trained surrogate
+
+
 class FilmTransferCoefficientType(Enum):
     fixed = auto()  # liquid phase film transfer coefficient is a user specified value
     calculated = (
@@ -179,6 +184,19 @@ class GACData(InitializationMixin, UnitModelBlockData):
         **MomentumBalanceType.pressurePhase** - pressure balances for each phase,
         **MomentumBalanceType.momentumTotal** - single momentum balance for material,
         **MomentumBalanceType.momentumPhase** - momentum balances for each phase.}""",
+        ),
+    )
+    CONFIG.declare(
+        "cphsdm_calaculation_method",
+        ConfigValue(
+            default=CPHSDMCalculationMethod.input,
+            domain=In(CPHSDMCalculationMethod),
+            description="CPHSDM calculation method",
+            doc="""Select the method of calculations for the empirical CPHSDM expressions
+        **default** - CPHSDMCalculationMethod.input.
+        **Valid values:** {
+        **CPHSDMCalculationMethod.input** - calculate CPHSDM model by inputting empirical parameterse,
+        **CPHSDMCalculationMethod.surrogate** - calculate CPHSDM model using pre-trained surrogate}""",
         ),
     )
     CONFIG.declare(
