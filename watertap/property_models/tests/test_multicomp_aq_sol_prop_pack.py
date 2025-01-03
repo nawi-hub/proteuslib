@@ -12,6 +12,7 @@
 import re
 
 import pytest
+
 from pyomo.environ import (
     ConcreteModel,
     assert_optimal_termination,
@@ -23,6 +24,11 @@ from pyomo.environ import (
     Var,
     Constraint,
 )
+from pyomo.util.check_units import assert_units_consistent, assert_units_equivalent
+
+# Imports from idaes core
+from idaes.core.base.components import Solvent, Solute, Cation, Anion
+from idaes.core.base.phases import PhaseType as PT
 from idaes.core import (
     FlowsheetBlock,
     MaterialFlowBasis,
@@ -31,19 +37,6 @@ from idaes.core import (
     EnergyBalanceType,
 )
 from idaes.core.util.scaling import calculate_scaling_factors, get_scaling_factor
-
-from pyomo.util.check_units import assert_units_consistent, assert_units_equivalent
-from watertap.property_models.multicomp_aq_sol_prop_pack import (
-    MCASParameterBlock,
-    MCASStateBlock,
-    ActivityCoefficientModel,
-    DensityCalculation,
-    DiffusivityCalculation,
-    ElectricalMobilityCalculation,
-    EquivalentConductivityCalculation,
-    TransportNumberCalculation,
-)
-from watertap.core.util.initialization import check_dof
 from idaes.core.util.model_statistics import (
     number_variables,
     number_total_constraints,
@@ -56,12 +49,11 @@ from idaes.core.util.scaling import (
     set_scaling_factor,
 )
 from idaes.core.util.exceptions import ConfigurationError
-from watertap.property_models.tests.property_test_harness import PropertyAttributeError
-from watertap.core.solvers import get_solver
-
-# Imports from idaes core
-from idaes.core.base.components import Solvent, Solute, Cation, Anion
-from idaes.core.base.phases import PhaseType as PT
+from idaes.core.scaling import set_scaling_factor
+from idaes.core.initialization import (
+    BlockTriangularizationInitializer,
+    InitializationStatus,
+)
 
 # Imports from idaes generic models
 from idaes.models.properties.modular_properties.pure.ConstantProperties import Constant
@@ -78,11 +70,41 @@ from idaes.models.unit_models import Mixer
 from idaes.models.unit_models.mixer import MixingType
 import idaes.logger as idaeslog
 
+from watertap.property_models.multicomp_aq_sol_prop_pack import (
+    MCASParameterBlock,
+    MCASStateBlock,
+    ActivityCoefficientModel,
+    DensityCalculation,
+    DiffusivityCalculation,
+    ElectricalMobilityCalculation,
+    EquivalentConductivityCalculation,
+    TransportNumberCalculation,
+    MCASScaler,
+)
+from watertap.core.util.initialization import check_dof
+from watertap.property_models.tests.property_test_harness import PropertyAttributeError
+from watertap.core.solvers import get_solver
 
 solver = get_solver()
 
 
 # -----------------------------------------------------------------------------
+@pytest.mark.unit
+def test_default_initializer_scaler():
+    m = ConcreteModel()
+    m.fs = FlowsheetBlock(dynamic=False)
+    m.fs.properties = MCASParameterBlock(
+        solute_list=["A"],
+        mw_data={"H2O": 0.018, "A": 0.01},
+        charge={"A": 0},
+    )
+
+    m.fs.state = m.fs.properties.build_state_block(m.fs.time)
+
+    assert m.fs.state.default_initializer is BlockTriangularizationInitializer
+    assert m.fs.state.default_scaler is MCASScaler
+
+
 @pytest.mark.unit
 def test_config():
     m = ConcreteModel()
@@ -2485,3 +2507,625 @@ def test_automatic_charge_mw_population():
     for comp, val in test_vals.items():
         assert value(m.fs.stream2[0].mw_comp[comp]) == val[0]
         assert value(m.fs.stream2[0].charge_comp[comp]) == val[1]
+
+
+class TestMCASInitializer:
+    @pytest.mark.component
+    def test_initialize(self):
+        m = ConcreteModel()
+        m.fs = FlowsheetBlock(dynamic=False)
+        m.fs.properties = MCASParameterBlock(
+            solute_list=["Ca_2+", "SO4_2-", "Na_+", "Cl_-", "Mg_2+"],
+            material_flow_basis=MaterialFlowBasis.mass,
+            diffusivity_data={
+                ("Liq", "Ca_2+"): 7.92e-10,
+                ("Liq", "SO4_2-"): 1.06e-09,
+                ("Liq", "Na_+"): 1.33e-09,
+                ("Liq", "Cl_-"): 2.03e-09,
+                ("Liq", "Mg_2+"): 7.06e-10,
+            },
+            mw_data={
+                "H2O": 0.018,
+                "Na_+": 0.023,
+                "Ca_2+": 0.04,
+                "Mg_2+": 0.024,
+                "Cl_-": 0.035,
+                "SO4_2-": 0.096,
+            },
+            stokes_radius_data={
+                "Na_+": 1.84e-10,
+                "Ca_2+": 3.09e-10,
+                "Mg_2+": 3.47e-10,
+                "Cl_-": 1.21e-10,
+                "SO4_2-": 2.3e-10,
+            },
+            charge={"Na_+": 1, "Ca_2+": 2, "Mg_2+": 2, "Cl_-": -1, "SO4_2-": -2},
+            elec_mobility_calculation=ElectricalMobilityCalculation.EinsteinRelation,
+            density_calculation=DensityCalculation.seawater,
+            activity_coefficient_model=ActivityCoefficientModel.davies,
+        )
+
+        m.fs.stream = stream = m.fs.properties.build_state_block(
+            [0], defined_state=True
+        )
+
+        mass_flow_in = 1 * pyunits.kg / pyunits.s
+        feed_mass_frac = {
+            "Na_+": 11122e-6,
+            "Ca_2+": 382e-6,
+            "Mg_2+": 1394e-6,
+            "SO4_2-": 2136e-6,
+            "Cl_-": 20300e-6,
+        }
+        for ion, x in feed_mass_frac.items():
+            mass_comp_flow = x * pyunits.kg / pyunits.kg * mass_flow_in
+
+            stream[0].flow_mass_phase_comp["Liq", ion].fix(mass_comp_flow)
+
+        H2O_mass_frac = 1 - sum(x for x in feed_mass_frac.values())
+
+        stream[0].flow_mass_phase_comp["Liq", "H2O"].fix(H2O_mass_frac)
+        stream[0].temperature.fix(298.15)
+        stream[0].pressure.fix(101325)
+
+        stream[0].assert_electroneutrality(
+            defined_state=True, tol=1e-2, adjust_by_ion="Cl_-"
+        )
+
+        metadata = m.fs.properties.get_metadata().properties
+        for v in metadata.list_supported_properties():
+            getattr(stream[0], v.name)
+            assert stream[0].is_property_constructed(v.name)
+
+        initializer = stream.default_initializer()
+        initializer.initialize(stream)
+        assert initializer.summary[stream]["status"] == InitializationStatus.Ok
+
+
+class TestMCASScaler:
+    @pytest.mark.component
+    def test_scaler(self):
+        m = ConcreteModel()
+        m.fs = FlowsheetBlock(dynamic=False)
+        m.fs.properties = MCASParameterBlock(
+            solute_list=["Ca_2+", "SO4_2-", "Na_+", "Cl_-", "Mg_2+"],
+            material_flow_basis=MaterialFlowBasis.mass,
+            diffusivity_data={
+                ("Liq", "Ca_2+"): 7.92e-10,
+                ("Liq", "SO4_2-"): 1.06e-09,
+                ("Liq", "Na_+"): 1.33e-09,
+                ("Liq", "Cl_-"): 2.03e-09,
+                ("Liq", "Mg_2+"): 7.06e-10,
+            },
+            mw_data={
+                "H2O": 0.018,
+                "Na_+": 0.023,
+                "Ca_2+": 0.04,
+                "Mg_2+": 0.024,
+                "Cl_-": 0.035,
+                "SO4_2-": 0.096,
+            },
+            stokes_radius_data={
+                "Na_+": 1.84e-10,
+                "Ca_2+": 3.09e-10,
+                "Mg_2+": 3.47e-10,
+                "Cl_-": 1.21e-10,
+                "SO4_2-": 2.3e-10,
+            },
+            charge={"Na_+": 1, "Ca_2+": 2, "Mg_2+": 2, "Cl_-": -1, "SO4_2-": -2},
+            elec_mobility_calculation=ElectricalMobilityCalculation.EinsteinRelation,
+            density_calculation=DensityCalculation.seawater,
+            activity_coefficient_model=ActivityCoefficientModel.davies,
+        )
+
+        m.fs.stream = stream = m.fs.properties.build_state_block(
+            [0], defined_state=True
+        )
+
+        mass_flow_in = 1 * pyunits.kg / pyunits.s
+        feed_mass_frac = {
+            "Na_+": 11122e-6,
+            "Ca_2+": 382e-6,
+            "Mg_2+": 1394e-6,
+            "SO4_2-": 2136e-6,
+            "Cl_-": 20300e-6,
+        }
+        for ion, x in feed_mass_frac.items():
+            mass_comp_flow = x * pyunits.kg / pyunits.kg * mass_flow_in
+
+            stream[0].flow_mass_phase_comp["Liq", ion].fix(mass_comp_flow)
+
+        H2O_mass_frac = 1 - sum(x for x in feed_mass_frac.values())
+
+        stream[0].flow_mass_phase_comp["Liq", "H2O"].fix(H2O_mass_frac)
+        stream[0].temperature.fix(298.15)
+        stream[0].pressure.fix(101325)
+
+        stream[0].assert_electroneutrality(
+            defined_state=True, tol=1e-2, adjust_by_ion="Cl_-"
+        )
+
+        metadata = m.fs.properties.get_metadata().properties
+        for v in metadata.list_supported_properties():
+            getattr(stream[0], v.name)
+            assert stream[0].is_property_constructed(v.name)
+
+        initializer = stream.default_initializer()
+        initializer.initialize(stream)
+        assert initializer.summary[stream]["status"] == InitializationStatus.Ok
+
+        scaler = stream.default_scaler()
+
+        set_scaling_factor(stream[0].flow_mass_phase_comp["Liq", "H2O"], 1)
+        set_scaling_factor(stream[0].flow_mass_phase_comp["Liq", "Ca_2+"], 1e4)
+        set_scaling_factor(stream[0].flow_mass_phase_comp["Liq", "SO4_2-"], 1e3)
+        set_scaling_factor(stream[0].flow_mass_phase_comp["Liq", "Na_+"], 1e2)
+        set_scaling_factor(stream[0].flow_mass_phase_comp["Liq", "Cl_-"], 1e2)
+        set_scaling_factor(stream[0].flow_mass_phase_comp["Liq", "Mg_2+"], 1e3)
+
+        scaler.scale_model(stream[0])
+
+        assert len(m.fs.stream[0].scaling_factor) == 154
+
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].temperature
+        ] == pytest.approx(0.01, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[m.fs.stream[0].pressure] == pytest.approx(
+            0.00001, rel=1e-3
+        )
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mass_phase_comp["Liq", "H2O"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mass_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(10000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mass_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mass_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mass_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mass_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mol_phase_comp["Liq", "H2O"]
+        ] == pytest.approx(0.0001, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mol_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(0.4, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mol_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(0.096, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mol_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(0.0023, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mol_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(0.0035, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mol_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(0.024, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mass_phase_comp["Liq", "H2O"]
+        ] == pytest.approx(0.001, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mass_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(10, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mass_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mass_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(0.1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mass_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(0.1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_mass_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].dens_mass_phase["Liq"]
+        ] == pytest.approx(0.001, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mass_frac_phase_comp["Liq", "H2O"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mass_frac_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(10000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mass_frac_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mass_frac_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mass_frac_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mass_frac_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].dens_mass_solvent
+        ] == pytest.approx(0.001, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].act_coeff_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].act_coeff_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].act_coeff_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].act_coeff_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].act_coeff_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].ionic_strength_molal
+        ] == pytest.approx(2.571, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].molality_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(18, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].molality_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(18, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].molality_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(18, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].molality_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(18, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].molality_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(18, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mol_phase_comp["Liq", "H2O"]
+        ] == pytest.approx(0.1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mol_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mol_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mol_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mol_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_mol_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].debye_huckel_constant
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].enth_mass_phase["Liq"]
+        ] == pytest.approx(0.00001, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].total_dissolved_solids
+        ] == pytest.approx(0.0000278, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_vol_phase["Liq"]
+        ] == pytest.approx(5556, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mole_frac_phase_comp["Liq", "H2O"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mole_frac_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mole_frac_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mole_frac_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mole_frac_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].mole_frac_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].pressure_osm_phase["Liq"]
+        ] == pytest.approx(0.00000129, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].pressure_sat
+        ] == pytest.approx(0.001, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].visc_k_phase["Liq"]
+        ] == pytest.approx(1000000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_equiv_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(10000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_equiv_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_equiv_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_equiv_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].flow_equiv_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_equiv_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(0.4, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_equiv_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(0.096, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_equiv_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(0.0023, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_equiv_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(0.0035, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].conc_equiv_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(0.024, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].equiv_conductivity_phase["Liq"]
+        ] == pytest.approx(1545, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].elec_mobility_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(250000000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].elec_mobility_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(250000000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].elec_mobility_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(250000000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].elec_mobility_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(250000000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].elec_mobility_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(250000000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].elec_cond_phase["Liq"]
+        ] == pytest.approx(3.225, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].trans_num_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(10, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].trans_num_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(10, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].trans_num_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(10, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].trans_num_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(10, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].trans_num_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(10, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].total_hardness
+        ] == pytest.approx(0.0001443, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mol_phase_comp["Liq", "H2O"]
+        ] == pytest.approx(0.001, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mol_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(10, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mol_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mol_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(0.1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mol_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(0.1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mol_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mass_phase_comp["Liq", "H2O"]
+        ] == pytest.approx(0.001, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mass_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(10, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mass_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mass_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(0.1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mass_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(0.1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_mass_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_dens_mass_phase["Liq"]
+        ] == pytest.approx(0.001, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mass_frac_phase_comp["Liq", "H2O"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mass_frac_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(2617, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mass_frac_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(468.1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mass_frac_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(89.89, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mass_frac_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(49.74, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mass_frac_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(717.2, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_dens_mass_solvent
+        ] == pytest.approx(0.001, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_act_coeff_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(65.09, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_act_coeff_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(65.09, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_act_coeff_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(260.4, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_act_coeff_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(260.4, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_act_coeff_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(65.09, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_ionic_strength_molal
+        ] == pytest.approx(2.571, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_molality_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(18, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_molality_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(18, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_molality_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(18, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_molality_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(18, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_molality_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(18, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_mol_phase_comp["Liq", "H2O"]
+        ] == pytest.approx(1.037, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_mol_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(2500, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_mol_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(468.2, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_mol_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(89.91, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_mol_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(49.75, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_mol_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(717.4, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_debye_huckel_constant
+        ] == pytest.approx(64.32, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_enth_mass_phase["Liq"]
+        ] == pytest.approx(0.0000007982, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_total_dissolved_solids
+        ] == pytest.approx(0.0000278, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_vol_phase["Liq"]
+        ] == pytest.approx(5489, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mole_frac_phase_comp["Liq", "H2O"]
+        ] == pytest.approx(1, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mole_frac_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mole_frac_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mole_frac_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mole_frac_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_mole_frac_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_pressure_osm_phase["Liq"]
+        ] == pytest.approx(0.0000009278, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_pressure_sat
+        ] == pytest.approx(0.0003216, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_visc_k_phase["Liq"]
+        ] == pytest.approx(1000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_equiv_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(50, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_equiv_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(50, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_equiv_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_equiv_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(100, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_flow_equiv_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(50, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_equiv_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(0.2, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_equiv_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(0.048, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_equiv_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(0.0023, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_equiv_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(0.0035, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_conc_equiv_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(0.012, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_equiv_conductivity_phase["Liq"]
+        ] == pytest.approx(1545, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_elec_mobility_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(16220000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_elec_mobility_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(12120000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_elec_mobility_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(19320000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_elec_mobility_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(12660000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_elec_mobility_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(18200000, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_elec_cond_phase["Liq"]
+        ] == pytest.approx(3.225, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_trans_num_phase_comp["Liq", "Ca_2+"]
+        ] == pytest.approx(10, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_trans_num_phase_comp["Liq", "SO4_2-"]
+        ] == pytest.approx(10, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_trans_num_phase_comp["Liq", "Na_+"]
+        ] == pytest.approx(1.908, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_trans_num_phase_comp["Liq", "Cl_-"]
+        ] == pytest.approx(2.904, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_trans_num_phase_comp["Liq", "Mg_2+"]
+        ] == pytest.approx(9.956, rel=1e-3)
+        assert m.fs.stream[0].scaling_factor[
+            m.fs.stream[0].eq_total_hardness
+        ] == pytest.approx(0.0001443, rel=1e-3)

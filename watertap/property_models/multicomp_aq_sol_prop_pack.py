@@ -24,8 +24,6 @@ nanofiltration.
 #  -add viscosity as func of temp and concentration
 
 # Import Python libraries
-import idaes.logger as idaeslog
-
 from enum import Enum, auto
 
 # Import Pyomo libraries
@@ -49,6 +47,7 @@ from pyomo.util.calc_var_value import calculate_variable_from_constraint
 from pyomo.core.base.units_container import InconsistentUnitsError
 
 # Import IDAES cores
+import idaes.logger as idaeslog
 from idaes.core import (
     declare_process_block_class,
     MaterialFlowBasis,
@@ -67,7 +66,6 @@ from idaes.core.util.initialization import (
     solve_indexed_blocks,
 )
 from idaes.core.util.misc import add_object_reference
-from watertap.core.solvers import get_solver
 from idaes.core.util.model_statistics import (
     degrees_of_freedom,
     number_unfixed_variables,
@@ -78,6 +76,10 @@ from idaes.core.util.exceptions import (
     PropertyPackageError,
 )
 import idaes.core.util.scaling as iscale
+from idaes.core.scaling import CustomScalerBase, ConstraintScalingScheme
+from idaes.core.initialization import BlockTriangularizationInitializer
+
+from watertap.core.solvers import get_solver
 from watertap.core.util.scaling import transform_property_constraints
 from watertap.core.util.chemistry import (
     get_charge,
@@ -118,6 +120,272 @@ class EquivalentConductivityCalculation(Enum):
 class TransportNumberCalculation(Enum):
     none = auto()
     ElectricalMobility = auto()
+
+
+class MCASScaler(CustomScalerBase):
+    DEFAULT_SCALING_FACTORS = {
+        "act_coeff_phase_comp": 1,
+        "debye_huckel_constant": 100,
+        "dens_mass_phase": 1e-3,
+        "dens_mass_solvent": 1e-3,
+        "diffus_phase_comp": 1e10,
+        "enth_mass_phase": 1e-5,
+        "flow_mass_phase_comp": 1e3,
+        "flow_mol_phase_comp": 1e2,
+        "pressure_sat": 1e-3,
+        "trans_num_phase_comp": 10,
+        "visc_k_phase": 1e6,
+    }
+
+    def variable_scaling_routine(
+        self, model, overwrite: bool = False, submodel_scalers: dict = None
+    ):
+        self.scale_variable_by_units(model.pressure, overwrite=overwrite)
+        self.scale_variable_by_units(model.temperature, overwrite=overwrite)
+
+        if model.is_property_constructed("flow_mol_phase_comp"):
+            for j in model.component_list:
+                if j == "H2O":
+                    self.set_variable_scaling_factor(
+                        model.flow_mol_phase_comp["Liq", j], 0.1, overwrite=overwrite
+                    )
+                else:
+                    self.scale_variable_by_default(
+                        model.flow_mol_phase_comp["Liq", j], overwrite=overwrite
+                    )
+
+        if model.is_property_constructed("flow_mass_phase_comp"):
+            for j in model.component_list:
+                if j == "H2O":
+                    self.set_variable_scaling_factor(
+                        model.flow_mass_phase_comp["Liq", j], 10, overwrite=overwrite
+                    )
+                else:
+                    self.scale_variable_by_default(
+                        model.flow_mass_phase_comp["Liq", j], overwrite=overwrite
+                    )
+
+        if model.is_property_constructed("flow_equiv_phase_comp"):
+            for (p, j), v in model.flow_equiv_phase_comp.items():
+                self.scale_variable_by_component(
+                    target_variable=v,
+                    scaling_component=model.flow_mass_phase_comp[p, j],
+                    overwrite=overwrite,
+                )
+
+        for n in self.DEFAULT_SCALING_FACTORS.keys():
+            if model.is_property_constructed(n):
+                c = model.find_component(n)
+                for v in c.values():
+                    self.scale_variable_by_default(v, overwrite=overwrite)
+
+        if model.is_property_constructed("mole_frac_phase_comp"):
+            for (p, j), v in model.mole_frac_phase_comp.items():
+                if j == "H2O":
+                    self.set_variable_scaling_factor(v, 1, overwrite=overwrite)
+                else:
+                    sf = self.get_scaling_factor(
+                        model.flow_mol_phase_comp[p, j]
+                    ) / self.get_scaling_factor(model.flow_mol_phase_comp["Liq", "H2O"])
+                    self.set_variable_scaling_factor(v, sf, overwrite=overwrite)
+
+        if model.is_property_constructed("mass_frac_phase_comp"):
+            for (p, j), v in model.mass_frac_phase_comp.items():
+                if j == "H2O":
+                    self.set_variable_scaling_factor(v, 1, overwrite=overwrite)
+                else:
+                    sf = self.get_scaling_factor(
+                        model.flow_mass_phase_comp[p, j]
+                    ) / self.get_scaling_factor(
+                        model.flow_mass_phase_comp["Liq", "H2O"]
+                    )
+                    self.set_variable_scaling_factor(v, sf, overwrite=overwrite)
+
+        if model.is_property_constructed("mass_frac_phase_comp"):
+            for (p, j), v in model.mass_frac_phase_comp.items():
+                if j == "H2O":
+                    self.set_variable_scaling_factor(v, 1, overwrite=overwrite)
+                else:
+                    sf = self.get_scaling_factor(
+                        model.flow_mass_phase_comp[p, j]
+                    ) / self.get_scaling_factor(
+                        model.flow_mass_phase_comp["Liq", "H2O"]
+                    )
+                    self.set_variable_scaling_factor(v, sf, overwrite=overwrite)
+
+        if model.is_property_constructed("conc_mass_phase_comp"):
+            for (p, j), v in model.conc_mass_phase_comp.items():
+                sf_dens = self.get_scaling_factor(model.dens_mass_phase[p])
+                if j == "H2O":
+                    # solvents typically have a mass fraction between 0.5-1
+                    self.set_variable_scaling_factor(
+                        v,
+                        sf_dens,
+                        overwrite=overwrite,
+                    )
+                else:
+                    sf_x = self.get_scaling_factor(model.mass_frac_phase_comp[p, j])
+                    self.set_variable_scaling_factor(
+                        v,
+                        sf_dens * sf_x,
+                        overwrite=overwrite,
+                    )
+
+        if model.is_property_constructed("conc_mol_phase_comp"):
+            for (p, j), v in model.conc_mol_phase_comp.items():
+                if j == "H2O":
+                    self.set_variable_scaling_factor(
+                        v,
+                        1e-4,
+                        overwrite=overwrite,
+                    )
+                else:
+                    sf_x = self.get_scaling_factor(model.conc_mass_phase_comp[p, j])
+                    # Multiply by MW as scaling factor is inverse of value
+                    self.set_variable_scaling_factor(
+                        v,
+                        value(sf_x * model.mw_comp[j]),
+                        overwrite=overwrite,
+                    )
+
+        if model.is_property_constructed("conc_equiv_phase_comp"):
+            for k, v in model.conc_equiv_phase_comp.items():
+                self.scale_variable_by_component(
+                    target_variable=v,
+                    scaling_component=model.conc_mol_phase_comp[k],
+                    overwrite=overwrite,
+                )
+
+        if model.is_property_constructed("pressure_osm_phase"):
+            sf_conc_mol = (
+                sum(
+                    self.get_scaling_factor(model.conc_mol_phase_comp["Liq", j]) ** -1
+                    for j in model.params.solute_set
+                )
+            ) ** -1
+            # R*T is generally of order 1e3
+            self.set_variable_scaling_factor(
+                model.pressure_osm_phase["Liq"], sf_conc_mol * 1e-3, overwrite=overwrite
+            )
+
+        if model.is_property_constructed("elec_mobility_phase_comp"):
+            for ind, v in model.elec_mobility_phase_comp.items():
+                if (
+                    model.params.config.elec_mobility_calculation
+                    == ElectricalMobilityCalculation.EinsteinRelation
+                ):
+                    sf = self.get_scaling_factor(model.diffus_phase_comp[ind]) / 40
+                else:
+                    sf = model.params.config.elec_mobility_data[ind] ** -1
+                self.set_variable_scaling_factor(v, sf, overwrite=overwrite)
+
+        if model.is_property_constructed("equiv_conductivity_phase"):
+            for v in model.equiv_conductivity_phase.values():
+                if (
+                    model.params.config.equiv_conductivity_calculation
+                    == EquivalentConductivityCalculation.ElectricalMobility
+                ):
+                    sf = (
+                        1e-5
+                        * sum(
+                            self.get_scaling_factor(
+                                model.elec_mobility_phase_comp["Liq", j]
+                            )
+                            ** -1
+                            * self.get_scaling_factor(
+                                model.conc_mol_phase_comp["Liq", j]
+                            )
+                            ** -1
+                            for j in model.params.ion_set
+                        )
+                        ** -1
+                        / sum(
+                            self.get_scaling_factor(model.conc_mol_phase_comp["Liq", j])
+                            ** -1
+                            for j in model.params.cation_set
+                        )
+                        ** -1
+                    )
+                else:
+                    sf = model.params.config.equiv_conductivity_phase_data[ind] ** -1
+                self.set_variable_scaling_factor(v, sf, overwrite=overwrite)
+
+        if model.is_property_constructed("elec_cond_phase"):
+            for ind, v in model.elec_cond_phase.items():
+                sf_equiv_cond_phase = self.get_scaling_factor(
+                    model.equiv_conductivity_phase[ind]
+                )
+                sf_conc_mol_z = (
+                    sum(
+                        self.get_scaling_factor(model.conc_mol_phase_comp["Liq", j])
+                        ** -1
+                        for j in model.params.cation_set
+                    )
+                    ** -1
+                )
+                sf = sf_equiv_cond_phase * sf_conc_mol_z
+                self.set_variable_scaling_factor(v, sf, overwrite=overwrite)
+
+        if model.is_property_constructed("flow_vol_phase"):
+            sf = (
+                self.get_scaling_factor(model.flow_mol_phase_comp["Liq", "H2O"])
+                / value(model.mw_comp["H2O"])
+                / self.get_scaling_factor(model.dens_mass_phase["Liq"])
+            )
+            self.set_variable_scaling_factor(
+                model.flow_vol_phase["Liq"], sf, overwrite=overwrite
+            )
+
+        if model.is_property_constructed("molality_phase_comp"):
+            for (p, j), v in model.molality_phase_comp.items():
+                sf = (
+                    self.get_scaling_factor(model.flow_mol_phase_comp[p, j])
+                    / self.get_scaling_factor(model.flow_mol_phase_comp[p, "H2O"])
+                    * value(model.mw_comp["H2O"])
+                )
+                self.set_variable_scaling_factor(v, sf, overwrite=overwrite)
+
+        if model.is_property_constructed("ionic_strength_molal"):
+            sf = (
+                sum(
+                    0.5
+                    * self.get_scaling_factor(model.molality_phase_comp["Liq", j]) ** -1
+                    * value(model.charge_comp[j]) ** 2
+                    for j in model.params.solute_set
+                )
+                ** -1
+            )
+            self.set_variable_scaling_factor(
+                model.ionic_strength_molal, sf, overwrite=overwrite
+            )
+
+        if model.is_property_constructed("total_hardness"):
+            if value(model.total_hardness) == 0:
+                sf = 1
+            else:
+                sf = 1 / value(model.total_hardness)
+            self.set_variable_scaling_factor(
+                model.total_hardness, sf, overwrite=overwrite
+            )
+
+        if model.is_property_constructed("total_dissolved_solids"):
+            if value(model.total_dissolved_solids) == 0:
+                sf = 1
+            else:
+                sf = 1 / value(model.total_dissolved_solids)
+            self.set_variable_scaling_factor(
+                model.total_dissolved_solids, sf, overwrite=overwrite
+            )
+
+    def constraint_scaling_routine(
+        self, model, overwrite: bool = False, submodel_scalers: dict = None
+    ):
+        for c in model.component_data_objects(Constraint, descend_into=True):
+            self.scale_constraint_by_nominal_value(
+                c,
+                scheme=ConstraintScalingScheme.inverseMaximum,
+                overwrite=overwrite,
+            )
 
 
 @declare_process_block_class("MCASParameterBlock")
@@ -688,6 +956,19 @@ class _MCASStateBlock(StateBlock):
     This Class contains methods which should be applied to Property Blocks as a whole, rather
     than individual elements of indexed Property Blocks.
     """
+
+    default_initializer = BlockTriangularizationInitializer
+    default_scaler = MCASScaler
+
+    def fix_initialization_states(self):
+        """
+        Fixes state variables for state blocks.
+
+        Returns:
+            None
+        """
+        # Fix state variables
+        fix_state_vars(self)
 
     def initialize(
         self,
