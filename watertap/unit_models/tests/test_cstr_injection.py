@@ -14,12 +14,15 @@ Tests for CSTR unit model with injection.
 Authors: Andrew Lee, Adam Atia, Vibhav Dabadghao
 """
 
+from io import StringIO
 import pytest
 from pyomo.environ import (
     ConcreteModel,
     units,
     value,
     Objective,
+    Suffix,
+    TransformationFactory,
 )
 from idaes.core import (
     FlowsheetBlock,
@@ -27,6 +30,12 @@ from idaes.core import (
 
 from watertap.unit_models.tests.unit_test_harness import UnitTestHarness
 import idaes.core.util.scaling as iscale
+from idaes.core.util.scaling import (
+    get_jacobian,
+    jacobian_cond,
+)
+from idaes.core.scaling.scaler_profiling import ScalingProfiler
+from idaes.core.scaling.scaling_base import ScalerBase
 from idaes.models.properties.examples.saponification_thermo import (
     SaponificationParameterBlock,
 )
@@ -36,14 +45,20 @@ from idaes.models.properties.examples.saponification_reactions import (
 from idaes.core.util.exceptions import ConfigurationError
 from watertap.core.solvers import get_solver
 
-from watertap.unit_models.cstr_injection import CSTR_Injection, ElectricityConsumption
+from watertap.unit_models.cstr_injection import (
+    CSTR_Injection,
+    ElectricityConsumption,
+    CSTR_InjectionScaler,
+)
 from idaes.core import UnitModelCostingBlock
 from watertap.costing import WaterTAPCosting
 from watertap.property_models.unit_specific.activated_sludge.asm1_properties import (
     ASM1ParameterBlock,
+    ASM1PropertiesScaler,
 )
 from watertap.property_models.unit_specific.activated_sludge.asm1_reactions import (
     ASM1ReactionParameterBlock,
+    ASM1ReactionScaler,
 )
 from watertap.property_models.unit_specific.activated_sludge.asm2d_properties import (
     ASM2dParameterBlock,
@@ -467,3 +482,642 @@ def test_error_without_oxygen():
             reaction_package=m.fs.reactions,
             has_aeration=True,
         )
+
+
+class TestCSTR_InjectionScaler:
+    @pytest.fixture
+    def model(self):
+        m = ConcreteModel()
+        m.fs = FlowsheetBlock(dynamic=False)
+
+        m.fs.properties = ASM1ParameterBlock()
+        m.fs.reactions = ASM1ReactionParameterBlock(property_package=m.fs.properties)
+
+        m.fs.unit = CSTR_Injection(
+            property_package=m.fs.properties,
+            reaction_package=m.fs.reactions,
+            has_aeration=True,
+            electricity_consumption=ElectricityConsumption.calculated,
+        )
+
+        m.fs.unit.inlet.flow_vol.fix(20648 * units.m**3 / units.day)
+        m.fs.unit.inlet.temperature.fix(308.15 * units.K)
+        m.fs.unit.inlet.pressure.fix(1 * units.atm)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(27 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_S"].fix(58 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_I"].fix(92 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_S"].fix(363 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BH"].fix(50 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BA"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_P"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_O"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NO"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NH"].fix(23 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ND"].fix(5 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ND"].fix(16 * units.g / units.m**3)
+        m.fs.unit.inlet.alkalinity.fix(7 * units.mol / units.m**3)
+
+        m.fs.unit.volume.fix(500)
+        m.fs.unit.injection.fix(0)
+        m.fs.unit.injection[0, "Liq", "S_O"].fix(2e-3)
+
+        return m
+
+    @pytest.mark.component
+    def test_variable_scaling_routine(self, model):
+        scaler = model.fs.unit.default_scaler()
+
+        assert isinstance(scaler, CSTR_InjectionScaler)
+
+        scaler.variable_scaling_routine(model.fs.unit)
+
+        # Inlet state
+        sfx_in = model.fs.unit.control_volume.properties_in[0].scaling_factor
+        assert isinstance(sfx_in, Suffix)
+        assert len(sfx_in) == 3
+        assert sfx_in[
+            model.fs.unit.control_volume.properties_in[0].flow_vol
+        ] == pytest.approx(1e1, rel=1e-8)
+        assert sfx_in[
+            model.fs.unit.control_volume.properties_in[0].pressure
+        ] == pytest.approx(1e-6, rel=1e-8)
+        assert sfx_in[
+            model.fs.unit.control_volume.properties_in[0].temperature
+        ] == pytest.approx(1e-1, rel=1e-8)
+
+        # Outlet state - should be the same as the inlet
+        sfx_out = model.fs.unit.control_volume.properties_out[0].scaling_factor
+        assert isinstance(sfx_out, Suffix)
+        assert len(sfx_out) == 3
+        assert sfx_out[
+            model.fs.unit.control_volume.properties_out[0].flow_vol
+        ] == pytest.approx(1e1, rel=1e-8)
+        assert sfx_out[
+            model.fs.unit.control_volume.properties_out[0].pressure
+        ] == pytest.approx(1e-6, rel=1e-8)
+        assert sfx_out[
+            model.fs.unit.control_volume.properties_out[0].temperature
+        ] == pytest.approx(1e-1, rel=1e-8)
+
+        # Reaction block
+        sfx_rxn = model.fs.unit.control_volume.reactions[0].scaling_factor
+        assert isinstance(sfx_rxn, Suffix)
+        assert len(sfx_rxn) == 8
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R1"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R2"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R3"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R4"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R5"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R6"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R7"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R8"]
+        ] == pytest.approx(1e2, rel=1e-8)
+
+        # Check that unit model has scaling factors
+        sfx_cv = model.fs.unit.control_volume.scaling_factor
+        assert isinstance(sfx_cv, Suffix)
+        assert len(sfx_cv) == 1
+        assert sfx_cv[model.fs.unit.control_volume.volume[0]] == pytest.approx(
+            1e-3, rel=1e-3
+        )
+
+    @pytest.mark.component
+    def test_constraint_scaling_routine(self, model):
+        scaler = model.fs.unit.default_scaler()
+
+        assert isinstance(scaler, CSTR_InjectionScaler)
+
+        scaler.constraint_scaling_routine(model.fs.unit)
+
+        sfx_out = model.fs.unit.control_volume.properties_out[0].scaling_factor
+        assert isinstance(sfx_out, Suffix)
+        assert len(sfx_out) == 0
+
+        sfx_rxn = model.fs.unit.control_volume.reactions[0].scaling_factor
+        assert isinstance(sfx_rxn, Suffix)
+        assert len(sfx_rxn) == 8
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R1"]
+        ] == pytest.approx(2.380752e5, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R2"]
+        ] == pytest.approx(1.49540985e8, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R3"]
+        ] == pytest.approx(1.75226112e6, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R4"]
+        ] == pytest.approx(2.88e6, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R5"]
+        ] == pytest.approx(1.728e7, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R6"]
+        ] == pytest.approx(1.728e5, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R7"]
+        ] == pytest.approx(3.174336e5, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R8"]
+        ] == pytest.approx(1, rel=1e-8)
+
+        sfx_unit = model.fs.unit.scaling_factor
+        assert isinstance(sfx_unit, Suffix)
+        assert len(sfx_unit) == 3
+        assert sfx_unit[model.fs.unit.eq_hydraulic_retention_time[0]] == pytest.approx(
+            4.77962962e-4, rel=1e-8
+        )
+        assert sfx_unit[model.fs.unit.eq_mass_transfer[0]] == pytest.approx(
+            0.004, rel=1e-8
+        )
+        assert sfx_unit[model.fs.unit.eq_electricity_consumption[0]] == pytest.approx(
+            0.09, rel=1e-8
+        )
+
+    @pytest.mark.component
+    def test_scale_model(self, model):
+        scaler = model.fs.unit.default_scaler()
+
+        assert isinstance(scaler, CSTR_InjectionScaler)
+
+        scaler.scale_model(model.fs.unit)
+
+        # Inlet state
+        sfx_in = model.fs.unit.control_volume.properties_in[0].scaling_factor
+        assert isinstance(sfx_in, Suffix)
+        assert len(sfx_in) == 3
+        assert sfx_in[
+            model.fs.unit.control_volume.properties_in[0].flow_vol
+        ] == pytest.approx(1e1, rel=1e-8)
+        assert sfx_in[
+            model.fs.unit.control_volume.properties_in[0].pressure
+        ] == pytest.approx(1e-6, rel=1e-8)
+        assert sfx_in[
+            model.fs.unit.control_volume.properties_in[0].temperature
+        ] == pytest.approx(1e-1, rel=1e-8)
+
+        # Outlet state - should be the same as the inlet
+        sfx_out = model.fs.unit.control_volume.properties_out[0].scaling_factor
+        assert isinstance(sfx_out, Suffix)
+        assert len(sfx_out) == 3
+        assert sfx_out[
+            model.fs.unit.control_volume.properties_out[0].flow_vol
+        ] == pytest.approx(1e1, rel=1e-8)
+        assert sfx_out[
+            model.fs.unit.control_volume.properties_out[0].pressure
+        ] == pytest.approx(1e-6, rel=1e-8)
+        assert sfx_out[
+            model.fs.unit.control_volume.properties_out[0].temperature
+        ] == pytest.approx(1e-1, rel=1e-8)
+
+        # Reaction block
+        sfx_rxn = model.fs.unit.control_volume.reactions[0].scaling_factor
+        assert isinstance(sfx_rxn, Suffix)
+        assert len(sfx_rxn) == 16
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R1"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R2"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R3"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R4"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R5"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R6"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R7"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0].reaction_rate["R8"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R1"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R2"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R3"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R4"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R5"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R6"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R7"]
+        ] == pytest.approx(1e2, rel=1e-8)
+        assert sfx_rxn[
+            model.fs.unit.control_volume.reactions[0.0].rate_expression["R8"]
+        ] == pytest.approx(1e2, rel=1e-8)
+
+        # Check that unit model has scaling factors
+        sfx_cv = model.fs.unit.control_volume.scaling_factor
+        assert isinstance(sfx_cv, Suffix)
+        assert len(sfx_cv) == 1
+        assert sfx_cv[model.fs.unit.control_volume.volume[0]] == pytest.approx(
+            1e-3, rel=1e-3
+        )
+
+        sfx_unit = model.fs.unit.scaling_factor
+        assert isinstance(sfx_unit, Suffix)
+        assert len(sfx_unit) == 3
+        assert sfx_unit[model.fs.unit.eq_hydraulic_retention_time[0]] == pytest.approx(
+            0.00047796296, rel=1e-8
+        )
+        assert sfx_unit[model.fs.unit.eq_mass_transfer[0]] == pytest.approx(
+            0.004, rel=1e-8
+        )
+        assert sfx_unit[model.fs.unit.eq_electricity_consumption[0]] == pytest.approx(
+            0.09, rel=1e-8
+        )
+
+    # TODO: Remove test once iscale is deprecated
+    @pytest.mark.integration
+    def test_example_case_iscale(self):
+        m = ConcreteModel()
+        m.fs = FlowsheetBlock(dynamic=False)
+
+        m.fs.properties = ASM1ParameterBlock()
+        m.fs.reactions = ASM1ReactionParameterBlock(property_package=m.fs.properties)
+
+        m.fs.unit = CSTR_Injection(
+            property_package=m.fs.properties,
+            reaction_package=m.fs.reactions,
+            has_aeration=True,
+            electricity_consumption=ElectricityConsumption.calculated,
+        )
+
+        m.fs.unit.inlet.flow_vol.fix(20648 * units.m**3 / units.day)
+        m.fs.unit.inlet.temperature.fix(308.15 * units.K)
+        m.fs.unit.inlet.pressure.fix(1 * units.atm)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(27 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_S"].fix(58 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_I"].fix(92 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_S"].fix(363 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BH"].fix(50 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BA"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_P"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_O"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NO"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NH"].fix(23 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ND"].fix(5 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ND"].fix(16 * units.g / units.m**3)
+        m.fs.unit.inlet.alkalinity.fix(7 * units.mol / units.m**3)
+
+        m.fs.unit.volume.fix(500)
+        m.fs.unit.injection.fix(0)
+        m.fs.unit.injection[0, "Liq", "S_O"].fix(2e-3)
+
+        # Set scaling factors for badly scaled variables
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.properties_out[0.0].pressure, 1e-5
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.properties_out[0.0].conc_mass_comp["X_P"], 1e3
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "S_S"], 1e3
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "X_S"], 1e3
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "X_BH"], 1e3
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "X_P"], 1e3
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "S_O"], 1e3
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "S_NH"], 1e3
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "S_ND"], 1e3
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "X_ND"], 1e3
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "S_ALK"], 1e3
+        )
+
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_extent[0.0, "R4"], 1e5
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_extent[0.0, "R6"], 1e5
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_extent[0.0, "R7"], 1e5
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.rate_reaction_extent[0.0, "R8"], 1e5
+        )
+
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.reactions[0.0].reaction_rate["R1"], 1e5
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.reactions[0.0].reaction_rate["R4"], 1e5
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.reactions[0.0].reaction_rate["R6"], 1e5
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.reactions[0.0].reaction_rate["R7"], 1e5
+        )
+        iscale.set_scaling_factor(
+            m.fs.unit.control_volume.reactions[0.0].reaction_rate["R8"], 1e5
+        )
+
+        iscale.calculate_scaling_factors(m.fs.unit)
+
+        # Check condition number to confirm scaling
+        sm = TransformationFactory("core.scale_model").create_using(m, rename=False)
+        jac, _ = get_jacobian(sm, scaled=False)
+        assert (jacobian_cond(jac=jac, scaled=False)) == pytest.approx(
+            1.0843930927394e13, rel=1e-3
+        )
+
+    @pytest.mark.integration
+    def test_example_case_scaler(self):
+        m = ConcreteModel()
+        m.fs = FlowsheetBlock(dynamic=False)
+
+        m.fs.properties = ASM1ParameterBlock()
+        m.fs.reactions = ASM1ReactionParameterBlock(property_package=m.fs.properties)
+
+        m.fs.unit = CSTR_Injection(
+            property_package=m.fs.properties,
+            reaction_package=m.fs.reactions,
+            has_aeration=True,
+            electricity_consumption=ElectricityConsumption.calculated,
+        )
+
+        m.fs.unit.inlet.flow_vol.fix(20648 * units.m**3 / units.day)
+        m.fs.unit.inlet.temperature.fix(308.15 * units.K)
+        m.fs.unit.inlet.pressure.fix(1 * units.atm)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(27 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_S"].fix(58 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_I"].fix(92 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_S"].fix(363 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BH"].fix(50 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BA"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_P"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_O"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NO"].fix(0 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NH"].fix(23 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ND"].fix(5 * units.g / units.m**3)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ND"].fix(16 * units.g / units.m**3)
+        m.fs.unit.inlet.alkalinity.fix(7 * units.mol / units.m**3)
+
+        m.fs.unit.volume.fix(500)
+        m.fs.unit.injection.fix(0)
+        m.fs.unit.injection[0, "Liq", "S_O"].fix(2e-3)
+
+        # Set scaling factors for badly scaled variables
+        sb = ScalerBase()
+        sb.set_variable_scaling_factor(m.fs.unit.hydraulic_retention_time[0], 1e-3)
+
+        scaler = CSTR_InjectionScaler()
+        scaler.scale_model(
+            m.fs.unit,
+            submodel_scalers={
+                m.fs.unit.control_volume.properties_in: ASM1PropertiesScaler,
+                m.fs.unit.control_volume.properties_out: ASM1PropertiesScaler,
+                m.fs.unit.control_volume.reactions: ASM1ReactionScaler,
+            },
+        )
+
+        # Check condition number to confirm scaling
+        sm = TransformationFactory("core.scale_model").create_using(m, rename=False)
+        jac, _ = get_jacobian(sm, scaled=False)
+        assert (jacobian_cond(jac=jac, scaled=False)) == pytest.approx(
+            5.09707868988e11, rel=1e-3
+        )
+
+
+def build_model():
+    m = ConcreteModel()
+    m.fs = FlowsheetBlock(dynamic=False)
+
+    m.fs.properties = ASM1ParameterBlock()
+    m.fs.reactions = ASM1ReactionParameterBlock(property_package=m.fs.properties)
+
+    m.fs.unit = CSTR_Injection(
+        property_package=m.fs.properties,
+        reaction_package=m.fs.reactions,
+        has_aeration=True,
+        electricity_consumption=ElectricityConsumption.calculated,
+    )
+
+    m.fs.unit.inlet.flow_vol.fix(20648 * units.m**3 / units.day)
+    m.fs.unit.inlet.temperature.fix(308.15 * units.K)
+    m.fs.unit.inlet.pressure.fix(1 * units.atm)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(27 * units.g / units.m**3)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_S"].fix(58 * units.g / units.m**3)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_I"].fix(92 * units.g / units.m**3)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_S"].fix(363 * units.g / units.m**3)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_BH"].fix(50 * units.g / units.m**3)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_BA"].fix(0 * units.g / units.m**3)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_P"].fix(0 * units.g / units.m**3)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_O"].fix(0 * units.g / units.m**3)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_NO"].fix(0 * units.g / units.m**3)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_NH"].fix(23 * units.g / units.m**3)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_ND"].fix(5 * units.g / units.m**3)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_ND"].fix(16 * units.g / units.m**3)
+    m.fs.unit.inlet.alkalinity.fix(7 * units.mol / units.m**3)
+
+    m.fs.unit.volume.fix(500)
+    m.fs.unit.injection.fix(0)
+    m.fs.unit.injection[0, "Liq", "S_O"].fix(2e-3)
+
+    solver = get_solver()
+    solver.solve(m)
+
+    return m
+
+
+def scale_vars_with_scalers(m):
+    scaler = CSTR_InjectionScaler()
+    scaler.scale_model(
+        m.fs.unit,
+        submodel_scalers={
+            m.fs.unit.control_volume.properties_in: ASM1PropertiesScaler,
+            m.fs.unit.control_volume.properties_out: ASM1PropertiesScaler,
+            m.fs.unit.control_volume.reactions: ASM1ReactionScaler,
+        },
+    )
+
+
+def scale_vars_with_iscale(m):
+    # Set scaling factors for badly scaled variables
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.properties_out[0.0].pressure, 1e-5
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.properties_out[0.0].conc_mass_comp["X_P"], 1e3
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "S_S"], 1e3
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "X_S"], 1e3
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "X_BH"], 1e3
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "X_P"], 1e3
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "S_O"], 1e3
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "S_NH"], 1e3
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "S_ND"], 1e3
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "X_ND"], 1e3
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_generation[0.0, "Liq", "S_ALK"], 1e3
+    )
+
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_extent[0.0, "R4"], 1e5
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_extent[0.0, "R6"], 1e5
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_extent[0.0, "R7"], 1e5
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.rate_reaction_extent[0.0, "R8"], 1e5
+    )
+
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.reactions[0.0].reaction_rate["R1"], 1e5
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.reactions[0.0].reaction_rate["R4"], 1e5
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.reactions[0.0].reaction_rate["R6"], 1e5
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.reactions[0.0].reaction_rate["R7"], 1e5
+    )
+    iscale.set_scaling_factor(
+        m.fs.unit.control_volume.reactions[0.0].reaction_rate["R8"], 1e5
+    )
+
+    iscale.calculate_scaling_factors(m.fs.unit)
+
+
+def perturb_solution(m):
+    m.fs.unit.inlet.flow_vol.fix(20648 * 0.9 * units.m**3 / units.day)
+    m.fs.unit.volume.fix(500 * 0.85)
+
+
+@pytest.mark.requires_idaes_solver
+@pytest.mark.unit
+def test_scaling_profiler_with_scalers():
+    sp = ScalingProfiler(
+        build_model=build_model,
+        user_scaling=scale_vars_with_scalers,
+        perturb_state=perturb_solution,
+    )
+
+    stream = StringIO()
+
+    sp.report_scaling_profiles(stream=stream)
+
+    expected = """
+============================================================================
+Scaling Profile Report
+----------------------------------------------------------------------------
+Scaling Method           || User Scaling           || Perfect Scaling
+Unscaled                 || 1.826E+16 | Solved 4   ||
+Vars Only                || 4.843E+13 | Solved 4   || 2.014E+21 | Solved 4  
+Harmonic                 || 9.974E+17 | Failed 49  || 4.443E+22 | Solved 18 
+Inverse Sum              || 3.001E+17 | Solved 10  || 2.399E+14 | Solved 4  
+Inverse Root Sum Squares || 3.001E+17 | Solved 4   || 3.412E+14 | Solved 4  
+Inverse Maximum          || 3.001E+17 | Solved 4   || 4.809E+14 | Solved 4  
+Inverse Minimum          || 9.974E+17 | Failed 49  || 4.455E+22 | Solved 18 
+Nominal L1 Norm          || 2.365E+09 | Solved 4   || 2.842E+14 | Solved 4  
+Nominal L2 Norm          || 1.648E+09 | Solved 4   || 3.755E+14 | Solved 4  
+Actual L1 Norm           || 8.636E+08 | Solved 4   || 5.461E+13 | Solved 4  
+Actual L2 Norm           || 7.902E+08 | Solved 4   || 6.491E+13 | Solved 4  
+============================================================================
+"""
+
+    assert stream.getvalue() == expected
+
+
+@pytest.mark.requires_idaes_solver
+@pytest.mark.unit
+def test_scaling_profiler_with_iscale():
+    sp = ScalingProfiler(
+        build_model=build_model,
+        user_scaling=scale_vars_with_iscale,
+        perturb_state=perturb_solution,
+    )
+
+    stream = StringIO()
+
+    sp.report_scaling_profiles(stream=stream)
+
+    expected = """
+============================================================================
+Scaling Profile Report
+----------------------------------------------------------------------------
+Scaling Method           || User Scaling           || Perfect Scaling
+Unscaled                 || 1.826E+16 | Solved 4   ||
+Vars Only                || 8.948E+12 | Solved 4   || 2.014E+21 | Solved 4  
+Harmonic                 || 1.044E+17 | Solved 57  || 4.443E+22 | Solved 18 
+Inverse Sum              || 5.247E+17 | Failed 50  || 2.399E+14 | Solved 4  
+Inverse Root Sum Squares || 5.220E+17 | Failed 55  || 3.412E+14 | Solved 4  
+Inverse Maximum          || 5.208E+17 | Failed 52  || 4.809E+14 | Solved 4  
+Inverse Minimum          || 2.103E+17 | Solved 65  || 4.455E+22 | Solved 18 
+Nominal L1 Norm          || 7.817E+09 | Solved 4   || 2.842E+14 | Solved 4  
+Nominal L2 Norm          || 1.278E+10 | Solved 4   || 3.755E+14 | Solved 4  
+Actual L1 Norm           || 3.950E+09 | Solved 3   || 5.461E+13 | Solved 4  
+Actual L2 Norm           || 4.339E+09 | Solved 3   || 6.491E+13 | Solved 4  
+============================================================================
+"""
+
+    assert stream.getvalue() == expected
