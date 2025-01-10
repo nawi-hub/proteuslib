@@ -12,12 +12,14 @@
 """
 Tests for dewatering unit example.
 """
-
+from io import StringIO
 import pytest
 from pyomo.environ import (
     ConcreteModel,
     value,
     assert_optimal_termination,
+    Suffix,
+    TransformationFactory,
     units as pyunits,
 )
 
@@ -26,6 +28,13 @@ from idaes.core import (
     MaterialBalanceType,
     MomentumBalanceType,
 )
+
+from idaes.core.util.scaling import (
+    get_jacobian,
+    jacobian_cond,
+)
+from idaes.core.scaling.scaling_base import ScalerBase
+from idaes.core.scaling.scaler_profiling import ScalingProfiler
 
 from idaes.models.unit_models.separator import SplittingType
 
@@ -49,9 +58,14 @@ from idaes.core.util.exceptions import (
     ConfigurationError,
 )
 
-from watertap.unit_models.dewatering import DewateringUnit, ActivatedSludgeModelType
+from watertap.unit_models.dewatering import (
+    DewateringUnit,
+    ActivatedSludgeModelType,
+    DewatererScaler,
+)
 from watertap.property_models.unit_specific.activated_sludge.asm1_properties import (
     ASM1ParameterBlock,
+    ASM1PropertiesScaler,
 )
 
 from watertap.property_models.unit_specific.activated_sludge.asm2d_properties import (
@@ -821,3 +835,481 @@ def test_du_costing_config_err():
                 "dewatering_type": "foo",
             },
         )
+
+
+class TestThickenerScaler:
+    @pytest.fixture
+    def model(self):
+        m = ConcreteModel()
+        m.fs = FlowsheetBlock(dynamic=False)
+
+        m.fs.props = ASM1ParameterBlock()
+
+        m.fs.unit = DewateringUnit(property_package=m.fs.props)
+
+        m.fs.unit.inlet.flow_vol.fix(178.4674 * units.m**3 / units.day)
+        m.fs.unit.inlet.temperature.fix(308.15 * units.K)
+        m.fs.unit.inlet.pressure.fix(1 * units.atm)
+
+        m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(130.867 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_S"].fix(258.5789 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_I"].fix(
+            17216.2434 * units.mg / units.liter
+        )
+        m.fs.unit.inlet.conc_mass_comp[0, "X_S"].fix(2611.4843 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BH"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BA"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_P"].fix(626.0652 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_O"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NO"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NH"].fix(
+            1442.7882 * units.mg / units.liter
+        )
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ND"].fix(0.54323 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ND"].fix(100.8668 * units.mg / units.liter)
+        m.fs.unit.inlet.alkalinity.fix(97.8459 * units.mol / units.m**3)
+
+        m.fs.unit.hydraulic_retention_time.fix()
+
+        return m
+
+    @pytest.mark.component
+    def test_variable_scaling_routine(self, model):
+        scaler = model.fs.unit.default_scaler()
+
+        assert isinstance(scaler, DewatererScaler)
+
+        scaler.variable_scaling_routine(model.fs.unit)
+
+        # Inlet state
+        sfx_in = model.fs.unit.mixed_state[0].scaling_factor
+        assert isinstance(sfx_in, Suffix)
+        assert len(sfx_in) == 3
+        assert sfx_in[model.fs.unit.mixed_state[0].flow_vol] == pytest.approx(
+            1e1, rel=1e-8
+        )
+        assert sfx_in[model.fs.unit.mixed_state[0].pressure] == pytest.approx(
+            1e-6, rel=1e-8
+        )
+        assert sfx_in[model.fs.unit.mixed_state[0].temperature] == pytest.approx(
+            1e-1, rel=1e-8
+        )
+
+        # Outlet state - should be the same as the inlet
+        sfx_underflow = model.fs.unit.underflow_state[0].scaling_factor
+        assert isinstance(sfx_underflow, Suffix)
+        assert len(sfx_underflow) == 3
+        assert sfx_underflow[
+            model.fs.unit.underflow_state[0].flow_vol
+        ] == pytest.approx(1e1, rel=1e-8)
+        assert sfx_underflow[
+            model.fs.unit.underflow_state[0].pressure
+        ] == pytest.approx(1e-6, rel=1e-8)
+        assert sfx_underflow[
+            model.fs.unit.underflow_state[0].temperature
+        ] == pytest.approx(1e-1, rel=1e-8)
+
+        sfx_overflow = model.fs.unit.overflow_state[0].scaling_factor
+        assert isinstance(sfx_overflow, Suffix)
+        assert len(sfx_overflow) == 3
+        assert sfx_overflow[model.fs.unit.overflow_state[0].flow_vol] == pytest.approx(
+            1e1, rel=1e-8
+        )
+        assert sfx_overflow[model.fs.unit.overflow_state[0].pressure] == pytest.approx(
+            1e-6, rel=1e-8
+        )
+        assert sfx_overflow[
+            model.fs.unit.overflow_state[0].temperature
+        ] == pytest.approx(1e-1, rel=1e-8)
+
+        # Check that unit model has scaling factors
+        sfx_unit = model.fs.unit.scaling_factor
+        assert isinstance(sfx_unit, Suffix)
+        assert len(sfx_unit) == 1
+        assert sfx_unit[model.fs.unit.volume[0]] == pytest.approx(1e-3, rel=1e-3)
+
+    @pytest.mark.component
+    def test_constraint_scaling_routine(self, model):
+        scaler = model.fs.unit.default_scaler()
+
+        assert isinstance(scaler, DewatererScaler)
+
+        scaler.constraint_scaling_routine(model.fs.unit)
+
+        sfx_unit = model.fs.unit.scaling_factor
+        assert isinstance(sfx_unit, Suffix)
+        assert len(sfx_unit) == 62
+        assert sfx_unit[model.fs.unit.eq_electricity_consumption[0]] == pytest.approx(
+            1, rel=1e-8
+        )
+        assert sfx_unit[model.fs.unit.eq_hydraulic_retention[0]] == pytest.approx(
+            1.14755273e-6, rel=1e-8
+        )
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_I"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_S"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_P"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_BH"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_BA"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_ND"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "H2O"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_I"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_S"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_O"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_NO"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_NH"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_ND"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_ALK"]
+        ] == pytest.approx(1, rel=1e-8)
+
+    @pytest.mark.component
+    def test_scale_model(self, model):
+        scaler = model.fs.unit.default_scaler()
+
+        assert isinstance(scaler, DewatererScaler)
+
+        scaler.scale_model(model.fs.unit)
+
+        # Inlet state
+        sfx_in = model.fs.unit.mixed_state[0].scaling_factor
+        assert isinstance(sfx_in, Suffix)
+        assert len(sfx_in) == 3
+        assert sfx_in[model.fs.unit.mixed_state[0].flow_vol] == pytest.approx(
+            1e1, rel=1e-8
+        )
+        assert sfx_in[model.fs.unit.mixed_state[0].pressure] == pytest.approx(
+            1e-6, rel=1e-8
+        )
+        assert sfx_in[model.fs.unit.mixed_state[0].temperature] == pytest.approx(
+            1e-1, rel=1e-8
+        )
+
+        # Outlet state - should be the same as the inlet
+        sfx_underflow = model.fs.unit.underflow_state[0].scaling_factor
+        assert isinstance(sfx_underflow, Suffix)
+        assert len(sfx_underflow) == 3
+        assert sfx_underflow[
+            model.fs.unit.underflow_state[0].flow_vol
+        ] == pytest.approx(1e1, rel=1e-8)
+        assert sfx_underflow[
+            model.fs.unit.underflow_state[0].pressure
+        ] == pytest.approx(1e-6, rel=1e-8)
+        assert sfx_underflow[
+            model.fs.unit.underflow_state[0].temperature
+        ] == pytest.approx(1e-1, rel=1e-8)
+
+        sfx_overflow = model.fs.unit.underflow_state[0].scaling_factor
+        assert isinstance(sfx_overflow, Suffix)
+        assert len(sfx_overflow) == 3
+        assert sfx_overflow[model.fs.unit.underflow_state[0].flow_vol] == pytest.approx(
+            1e1, rel=1e-8
+        )
+        assert sfx_overflow[model.fs.unit.underflow_state[0].pressure] == pytest.approx(
+            1e-6, rel=1e-8
+        )
+        assert sfx_overflow[
+            model.fs.unit.underflow_state[0].temperature
+        ] == pytest.approx(1e-1, rel=1e-8)
+
+        # Check that unit model has scaling factors
+        sfx_unit = model.fs.unit.scaling_factor
+        assert isinstance(sfx_unit, Suffix)
+        assert len(sfx_unit) == 63
+        assert sfx_unit[model.fs.unit.volume[0]] == pytest.approx(1e-3, rel=1e-3)
+        assert sfx_unit[model.fs.unit.eq_electricity_consumption[0]] == pytest.approx(
+            1, rel=1e-8
+        )
+        assert sfx_unit[model.fs.unit.eq_hydraulic_retention[0]] == pytest.approx(
+            2.06559491e-6, rel=1e-8
+        )
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_I"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_S"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_P"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_BH"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_BA"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.overflow_particulate_fraction[0, "X_ND"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "H2O"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_I"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_S"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_O"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_NO"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_NH"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_ND"]
+        ] == pytest.approx(1, rel=1e-8)
+        assert sfx_unit[
+            model.fs.unit.non_particulate_components[0, "S_ALK"]
+        ] == pytest.approx(1, rel=1e-8)
+
+    # TODO: Remove test once iscale is deprecated
+    @pytest.mark.integration
+    def test_example_case_iscale(self):
+        m = ConcreteModel()
+        m.fs = FlowsheetBlock(dynamic=False)
+
+        m.fs.props = ASM1ParameterBlock()
+
+        m.fs.unit = DewateringUnit(property_package=m.fs.props)
+
+        m.fs.unit.inlet.flow_vol.fix(178.4674 * units.m**3 / units.day)
+        m.fs.unit.inlet.temperature.fix(308.15 * units.K)
+        m.fs.unit.inlet.pressure.fix(1 * units.atm)
+
+        m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(130.867 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_S"].fix(258.5789 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_I"].fix(
+            17216.2434 * units.mg / units.liter
+        )
+        m.fs.unit.inlet.conc_mass_comp[0, "X_S"].fix(2611.4843 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BH"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BA"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_P"].fix(626.0652 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_O"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NO"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NH"].fix(
+            1442.7882 * units.mg / units.liter
+        )
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ND"].fix(0.54323 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ND"].fix(100.8668 * units.mg / units.liter)
+        m.fs.unit.inlet.alkalinity.fix(97.8459 * units.mol / units.m**3)
+
+        m.fs.unit.hydraulic_retention_time.fix()
+
+        iscale.calculate_scaling_factors(m.fs.unit)
+
+        # Check condition number to confirm scaling
+        sm = TransformationFactory("core.scale_model").create_using(m, rename=False)
+        jac, _ = get_jacobian(sm, scaled=False)
+        assert (jacobian_cond(jac=jac, scaled=False)) == pytest.approx(
+            3.3758830009e5, rel=1e-3
+        )
+
+    @pytest.mark.integration
+    def test_example_case_scaler(self):
+        m = ConcreteModel()
+        m.fs = FlowsheetBlock(dynamic=False)
+
+        m.fs.props = ASM1ParameterBlock()
+
+        m.fs.unit = DewateringUnit(property_package=m.fs.props)
+
+        m.fs.unit.inlet.flow_vol.fix(178.4674 * units.m**3 / units.day)
+        m.fs.unit.inlet.temperature.fix(308.15 * units.K)
+        m.fs.unit.inlet.pressure.fix(1 * units.atm)
+
+        m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(130.867 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_S"].fix(258.5789 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_I"].fix(
+            17216.2434 * units.mg / units.liter
+        )
+        m.fs.unit.inlet.conc_mass_comp[0, "X_S"].fix(2611.4843 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BH"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_BA"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_P"].fix(626.0652 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_O"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NO"].fix(1e-6 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "S_NH"].fix(
+            1442.7882 * units.mg / units.liter
+        )
+        m.fs.unit.inlet.conc_mass_comp[0, "S_ND"].fix(0.54323 * units.mg / units.liter)
+        m.fs.unit.inlet.conc_mass_comp[0, "X_ND"].fix(100.8668 * units.mg / units.liter)
+        m.fs.unit.inlet.alkalinity.fix(97.8459 * units.mol / units.m**3)
+
+        m.fs.unit.hydraulic_retention_time.fix()
+
+        sb = ScalerBase()
+
+        scaler = DewatererScaler()
+        scaler.scale_model(
+            m.fs.unit,
+            submodel_scalers={
+                m.fs.unit.mixed_state: ASM1PropertiesScaler,
+                m.fs.unit.underflow_state: ASM1PropertiesScaler,
+                m.fs.unit.overflow_state: ASM1PropertiesScaler,
+            },
+        )
+
+        # Check condition number to confirm scaling
+        sm = TransformationFactory("core.scale_model").create_using(m, rename=False)
+        jac, _ = get_jacobian(sm, scaled=False)
+        assert (jacobian_cond(jac=jac, scaled=False)) == pytest.approx(
+            2.100583344e4, rel=1e-3
+        )
+
+
+def build_model():
+    m = ConcreteModel()
+    m.fs = FlowsheetBlock(dynamic=False)
+
+    m.fs.props = ASM1ParameterBlock()
+
+    m.fs.unit = DewateringUnit(property_package=m.fs.props)
+
+    m.fs.unit.inlet.flow_vol.fix(178.4674 * units.m**3 / units.day)
+    m.fs.unit.inlet.temperature.fix(308.15 * units.K)
+    m.fs.unit.inlet.pressure.fix(1 * units.atm)
+
+    m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(130.867 * units.mg / units.liter)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_S"].fix(258.5789 * units.mg / units.liter)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_I"].fix(17216.2434 * units.mg / units.liter)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_S"].fix(2611.4843 * units.mg / units.liter)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_BH"].fix(1e-6 * units.mg / units.liter)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_BA"].fix(1e-6 * units.mg / units.liter)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_P"].fix(626.0652 * units.mg / units.liter)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_O"].fix(1e-6 * units.mg / units.liter)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_NO"].fix(1e-6 * units.mg / units.liter)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_NH"].fix(1442.7882 * units.mg / units.liter)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_ND"].fix(0.54323 * units.mg / units.liter)
+    m.fs.unit.inlet.conc_mass_comp[0, "X_ND"].fix(100.8668 * units.mg / units.liter)
+    m.fs.unit.inlet.alkalinity.fix(97.8459 * units.mol / units.m**3)
+
+    m.fs.unit.hydraulic_retention_time.fix()
+
+    solver = get_solver()
+    solver.solve(m)
+
+    return m
+
+
+def scale_vars_with_scalers(m):
+    scaler = DewatererScaler()
+    scaler.scale_model(
+        m.fs.unit,
+        submodel_scalers={
+            m.fs.unit.mixed_state: ASM1PropertiesScaler,
+            m.fs.unit.underflow_state: ASM1PropertiesScaler,
+            m.fs.unit.overflow_state: ASM1PropertiesScaler,
+        },
+    )
+
+
+def scale_vars_with_iscale(m):
+    # Set scaling factors for badly scaled variables
+    iscale.calculate_scaling_factors(m.fs.unit)
+
+
+def perturb_solution(m):
+    m.fs.unit.inlet.flow_vol.fix(178.4674 * 0.8 * units.m**3 / units.day)
+    m.fs.unit.inlet.conc_mass_comp[0, "S_I"].fix(
+        130.867 * 0.55 * units.mg / units.liter
+    )
+
+
+@pytest.mark.requires_idaes_solver
+@pytest.mark.unit
+def test_scaling_profiler_with_scalers():
+    sp = ScalingProfiler(
+        build_model=build_model,
+        user_scaling=scale_vars_with_scalers,
+        perturb_state=perturb_solution,
+    )
+
+    stream = StringIO()
+
+    sp.report_scaling_profiles(stream=stream)
+
+    expected = """
+============================================================================
+Scaling Profile Report
+----------------------------------------------------------------------------
+Scaling Method           || User Scaling           || Perfect Scaling
+Unscaled                 || 4.958E+07 | Solved 1   ||
+Vars Only                || 1.379E+13 | Solved 3   || 1.270E+18 | Solved 5  
+Harmonic                 || 1.379E+13 | Solved 3   || 1.314E+05 | Solved 1  
+Inverse Sum              || 1.379E+13 | Solved 3   || 4.501E+03 | Solved 1  
+Inverse Root Sum Squares || 1.379E+13 | Solved 3   || 6.085E+03 | Solved 1  
+Inverse Maximum          || 1.379E+13 | Solved 3   || 8.354E+03 | Solved 1  
+Inverse Minimum          || 1.379E+13 | Solved 3   || 1.236E+05 | Solved 1  
+Nominal L1 Norm          || 1.379E+13 | Solved 3   || 4.933E+03 | Solved 1  
+Nominal L2 Norm          || 1.379E+13 | Solved 3   || 5.883E+03 | Solved 1  
+Actual L1 Norm           || 1.379E+13 | Solved 3   || 5.468E+13 | Solved 1  
+Actual L2 Norm           || 1.379E+13 | Solved 3   || 6.356E+13 | Solved 1  
+============================================================================
+"""
+
+    assert stream.getvalue() == expected
+
+
+@pytest.mark.requires_idaes_solver
+@pytest.mark.unit
+def test_scaling_profiler_with_iscale():
+    sp = ScalingProfiler(
+        build_model=build_model,
+        user_scaling=scale_vars_with_iscale,
+        perturb_state=perturb_solution,
+    )
+
+    stream = StringIO()
+
+    sp.report_scaling_profiles(stream=stream)
+
+    expected = """
+============================================================================
+Scaling Profile Report
+----------------------------------------------------------------------------
+Scaling Method           || User Scaling           || Perfect Scaling
+Unscaled                 || 4.958E+07 | Solved 1   ||
+Vars Only                || 9.503E+10 | Solved 3   || 1.270E+18 | Solved 5  
+Harmonic                 || 5.041E+15 | Solved 3   || 1.314E+05 | Solved 1  
+Inverse Sum              || 9.487E+14 | Solved 3   || 4.501E+03 | Solved 1  
+Inverse Root Sum Squares || 7.199E+14 | Solved 3   || 6.085E+03 | Solved 1  
+Inverse Maximum          || 5.224E+14 | Solved 3   || 8.354E+03 | Solved 1  
+Inverse Minimum          || 9.593E+15 | Solved 3   || 1.236E+05 | Solved 1  
+Nominal L1 Norm          || 1.493E+09 | Solved 1   || 4.933E+03 | Solved 1  
+Nominal L2 Norm          || 1.558E+09 | Solved 1   || 5.883E+03 | Solved 1  
+Actual L1 Norm           || 2.955E+07 | Solved 2   || 5.468E+13 | Solved 1  
+Actual L2 Norm           || 3.193E+07 | Solved 2   || 6.356E+13 | Solved 1  
+============================================================================
+"""
+
+    assert stream.getvalue() == expected
