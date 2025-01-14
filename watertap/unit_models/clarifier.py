@@ -22,8 +22,10 @@ from idaes.models.unit_models.separator import SeparatorData, SplittingType
 
 from idaes.core.util.tables import create_stream_table_dataframe
 import idaes.logger as idaeslog
+from idaes.core.scaling import CustomScalerBase, ConstraintScalingScheme
 
 from pyomo.environ import (
+    Constraint,
     Var,
     Param,
     units as pyunits,
@@ -40,11 +42,114 @@ __author__ = "Chenyu Wang"
 _log = idaeslog.getLogger(__name__)
 
 
+class ClarifierScaler(CustomScalerBase):
+    """
+    Default modular scaler for the clarifier unit model.
+    This Scaler relies on the associated property and reaction packages,
+    either through user provided options (submodel_scalers argument) or by default
+    Scalers assigned to the packages.
+    """
+
+    DEFAULT_SCALING_FACTORS = {
+        "surface_area": 1e-3,
+    }
+
+    def variable_scaling_routine(
+        self, model, overwrite: bool = False, submodel_scalers: dict = None
+    ):
+        """
+        Routine to apply scaling factors to variables in model.
+        Args:
+            model: model to be scaled
+            overwrite: whether to overwrite existing scaling factors
+            submodel_scalers: dict of Scalers to use for sub-models, keyed by submodel local name
+        Returns:
+            None
+        """
+        # Call scaling methods for sub-models
+        self.call_submodel_scaler_method(
+            submodel=model.mixed_state,
+            method="variable_scaling_routine",
+            submodel_scalers=submodel_scalers,
+            overwrite=overwrite,
+        )
+        self.propagate_state_scaling(
+            target_state=model.underflow_state,
+            source_state=model.mixed_state,
+            overwrite=overwrite,
+        )
+        self.propagate_state_scaling(
+            target_state=model.effluent_state,
+            source_state=model.mixed_state,
+            overwrite=overwrite,
+        )
+
+        self.call_submodel_scaler_method(
+            submodel=model.underflow_state,
+            method="variable_scaling_routine",
+            submodel_scalers=submodel_scalers,
+            overwrite=overwrite,
+        )
+        self.call_submodel_scaler_method(
+            submodel=model.effluent_state,
+            method="variable_scaling_routine",
+            submodel_scalers=submodel_scalers,
+            overwrite=overwrite,
+        )
+
+        # Scale unit level variables
+        self.scale_variable_by_default(model.surface_area, overwrite=overwrite)
+
+    def constraint_scaling_routine(
+        self, model, overwrite: bool = False, submodel_scalers: dict = None
+    ):
+        """
+        Routine to apply scaling factors to constraints in model.
+        Submodel Scalers are called for the property and reaction blocks. All other constraints
+        are scaled using the inverse maximum scheme.
+        Args:
+            model: model to be scaled
+            overwrite: whether to overwrite existing scaling factors
+            submodel_scalers: dict of Scalers to use for sub-models, keyed by submodel local name
+        Returns:
+            None
+        """
+        # Call scaling methods for sub-models
+        self.call_submodel_scaler_method(
+            submodel=model.mixed_state,
+            method="constraint_scaling_routine",
+            submodel_scalers=submodel_scalers,
+            overwrite=overwrite,
+        )
+        self.call_submodel_scaler_method(
+            submodel=model.underflow_state,
+            method="constraint_scaling_routine",
+            submodel_scalers=submodel_scalers,
+            overwrite=overwrite,
+        )
+        self.call_submodel_scaler_method(
+            submodel=model.effluent_state,
+            method="constraint_scaling_routine",
+            submodel_scalers=submodel_scalers,
+            overwrite=overwrite,
+        )
+
+        # Scale unit level constraints
+        for c in model.component_data_objects(Constraint, descend_into=False):
+            self.scale_constraint_by_nominal_value(
+                c,
+                scheme=ConstraintScalingScheme.inverseMaximum,
+                overwrite=overwrite,
+            )
+
+
 @declare_process_block_class("Clarifier")
 class ClarifierData(SeparatorData):
     """
-    Thickener unit model for BSM2
+    Clarifier unit model for BSM2
     """
+
+    default_scaler = ClarifierScaler
 
     CONFIG = SeparatorData.CONFIG()
     CONFIG.outlet_list = ["underflow", "overflow"]

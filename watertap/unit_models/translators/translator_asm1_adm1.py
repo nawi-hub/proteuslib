@@ -36,8 +36,10 @@ from idaes.core.util.model_statistics import degrees_of_freedom
 from watertap.core.solvers import get_solver
 import idaes.logger as idaeslog
 import idaes.core.util.scaling as iscale
+from idaes.core.scaling import CustomScalerBase, ConstraintScalingScheme
 
 from pyomo.environ import (
+    Constraint,
     Param,
     NonNegativeReals,
     Var,
@@ -56,11 +58,86 @@ __author__ = "Alejandro Garciadiego, Xinhong Liu"
 _log = idaeslog.getLogger(__name__)
 
 
+class ASM1ADM1Scaler(CustomScalerBase):
+    """
+    Default modular scaler for the ASM1-ADM1 translator block.
+    This Scaler relies on the associated property and reaction packages,
+    either through user provided options (submodel_scalers argument) or by default
+    Scalers assigned to the packages.
+    """
+
+    def variable_scaling_routine(
+        self, model, overwrite: bool = False, submodel_scalers: dict = None
+    ):
+        """
+        Routine to apply scaling factors to variables in model.
+        Args:
+            model: model to be scaled
+            overwrite: whether to overwrite existing scaling factors
+            submodel_scalers: dict of Scalers to use for sub-models, keyed by submodel local name
+        Returns:
+            None
+        """
+
+        # Call scaling methods for sub-models
+        self.call_submodel_scaler_method(
+            submodel=model.properties_in,
+            method="variable_scaling_routine",
+            submodel_scalers=submodel_scalers,
+            overwrite=overwrite,
+        )
+
+        self.call_submodel_scaler_method(
+            submodel=model.properties_out,
+            method="variable_scaling_routine",
+            submodel_scalers=submodel_scalers,
+            overwrite=overwrite,
+        )
+
+    def constraint_scaling_routine(
+        self, model, overwrite: bool = False, submodel_scalers: dict = None
+    ):
+        """
+        Routine to apply scaling factors to constraints in model.
+        Submodel Scalers are called for the property and reaction blocks. All other constraints
+        are scaled using the inverse maximum scheme.
+        Args:
+            model: model to be scaled
+            overwrite: whether to overwrite existing scaling factors
+            submodel_scalers: dict of Scalers to use for sub-models, keyed by submodel local name
+        Returns:
+            None
+        """
+        # Call scaling methods for sub-models
+        self.call_submodel_scaler_method(
+            submodel=model.properties_in,
+            method="constraint_scaling_routine",
+            submodel_scalers=submodel_scalers,
+            overwrite=overwrite,
+        )
+        self.call_submodel_scaler_method(
+            submodel=model.properties_out,
+            method="constraint_scaling_routine",
+            submodel_scalers=submodel_scalers,
+            overwrite=overwrite,
+        )
+
+        # Scale unit level constraints
+        for c in model.component_data_objects(Constraint, descend_into=False):
+            self.scale_constraint_by_nominal_value(
+                c,
+                scheme=ConstraintScalingScheme.inverseMaximum,
+                overwrite=overwrite,
+            )
+
+
 @declare_process_block_class("Translator_ASM1_ADM1")
 class TranslatorDataASM1ADM1(TranslatorData):
     """
     Translator block representing the ASM1/ADM1 interface
     """
+
+    default_scaler = ASM1ADM1Scaler
 
     CONFIG = TranslatorData.CONFIG()
     CONFIG.declare(
