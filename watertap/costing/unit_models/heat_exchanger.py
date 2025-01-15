@@ -34,7 +34,8 @@ def build_heat_exchanger_cost_param_block(blk):
         doc="steam cost per kg",
     )
 
-    blk.parent_block().register_flow_type("steam", blk.steam_cost)
+    costing = blk.parent_block()
+    costing.register_flow_type("steam", blk.steam_cost)
 
 
 @register_costing_parameter_block(

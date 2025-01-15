@@ -93,7 +93,7 @@ def build_crystallizer_cost_param_block(blk):
     )
 
     costing = blk.parent_block()
-    costing.register_flow_type("steam", blk.steam_cost)
+    #costing.register_flow_type("steam", blk.steam_cost)
     costing.register_flow_type("NaCl", blk.NaCl_recovery_value)
 
 
@@ -120,27 +120,6 @@ def cost_crystallizer(blk, cost_type=CrystallizerCostType.default):
 
 
 def _cost_crystallizer_flows(blk):
-    blk.costing_package.cost_flow(
-        pyo.units.convert(
-            (
-                blk.unit_model.magma_circulation_flow_vol
-                * blk.unit_model.dens_mass_slurry
-                * Constants.acceleration_gravity
-                * blk.costing_package.crystallizer.pump_head_height
-                / blk.costing_package.crystallizer.efficiency_pump
-            ),
-            to_units=pyo.units.kW,
-        ),
-        "electricity",
-    )
-
-    blk.costing_package.cost_flow(
-        pyo.units.convert(
-            (blk.unit_model.work_mechanical[0] / _compute_steam_properties(blk)),
-            to_units=pyo.units.m**3 / pyo.units.s,
-        ),
-        "steam",
-    )
 
     blk.costing_package.cost_flow(
         blk.unit_model.solids.flow_mass_phase_comp[0, "Sol", "NaCl"],
@@ -215,72 +194,3 @@ def cost_crystallizer_by_volume(blk):
         )
     )
     _cost_crystallizer_flows(blk)
-
-
-def _compute_steam_properties(blk):
-    """
-    Function for computing saturated steam properties for thermal heating estimation.
-
-    Args:
-        pressure_sat:   Steam gauge pressure in bar
-
-    Out:
-        Steam thermal capacity (latent heat of condensation * density) in kJ/m3
-    """
-    pressure_sat = blk.costing_package.crystallizer.steam_pressure
-    # 1. Compute saturation temperature of steam: computed from El-Dessouky expression
-    tsat_constants = [
-        42.6776 * pyo.units.K,
-        -3892.7 * pyo.units.K,
-        1000 * pyo.units.kPa,
-        -9.48654 * pyo.units.dimensionless,
-    ]
-    psat = (
-        pyo.units.convert(pressure_sat, to_units=pyo.units.kPa)
-        + 101.325 * pyo.units.kPa
-    )
-    temperature_sat = tsat_constants[0] + tsat_constants[1] / (
-        pyo.log(psat / tsat_constants[2]) + tsat_constants[3]
-    )
-
-    # 2. Compute latent heat of condensation/vaporization: computed from Sharqawy expression
-    t = temperature_sat - 273.15 * pyo.units.K
-    enth_mass_units = pyo.units.J / pyo.units.kg
-    t_inv_units = pyo.units.K**-1
-    dh_constants = [
-        2.501e6 * enth_mass_units,
-        -2.369e3 * enth_mass_units * t_inv_units**1,
-        2.678e-1 * enth_mass_units * t_inv_units**2,
-        -8.103e-3 * enth_mass_units * t_inv_units**3,
-        -2.079e-5 * enth_mass_units * t_inv_units**4,
-    ]
-    dh_vap = (
-        dh_constants[0]
-        + dh_constants[1] * t
-        + dh_constants[2] * t**2
-        + dh_constants[3] * t**3
-        + dh_constants[4] * t**4
-    )
-    dh_vap = pyo.units.convert(dh_vap, to_units=pyo.units.kJ / pyo.units.kg)
-
-    # 3. Compute specific volume: computed from Affandi expression (Eq 5)
-    t_critical = 647.096 * pyo.units.K
-    t_red = temperature_sat / t_critical  # Reduced temperature
-    sp_vol_constants = [
-        -7.75883 * pyo.units.dimensionless,
-        3.23753 * pyo.units.dimensionless,
-        2.05755 * pyo.units.dimensionless,
-        -0.06052 * pyo.units.dimensionless,
-        0.00529 * pyo.units.dimensionless,
-    ]
-    log_sp_vol = (
-        sp_vol_constants[0]
-        + sp_vol_constants[1] * (pyo.log(1 / t_red)) ** 0.4
-        + sp_vol_constants[2] / (t_red**2)
-        + sp_vol_constants[3] / (t_red**4)
-        + sp_vol_constants[4] / (t_red**5)
-    )
-    sp_vol = pyo.exp(log_sp_vol) * pyo.units.m**3 / pyo.units.kg
-
-    # 4. Return specific energy: density * latent heat
-    return dh_vap / sp_vol
