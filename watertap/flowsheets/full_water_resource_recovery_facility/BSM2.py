@@ -10,7 +10,7 @@
 # "https://github.com/watertap-org/watertap/"
 #################################################################################
 """
-Flowsheet example full Water Resource Recovery Facility 
+Flowsheet example full Water Resource Recovery Facility
 (WRRF; a.k.a., wastewater treatment plant) with ASM1 and ADM1.
 
 The flowsheet follows the same formulation as benchmark simulation model no.2 (BSM2)

@@ -25,6 +25,10 @@ from pyomo.environ import assert_optimal_termination, value
 from pyomo.util.check_units import assert_units_consistent
 
 from idaes.core.util.model_statistics import degrees_of_freedom
+from idaes.core.util.scaling import (
+    get_jacobian,
+    jacobian_cond,
+)
 
 from watertap.flowsheets.full_water_resource_recovery_facility.BSM2_P_extension import (
     main,
@@ -56,58 +60,58 @@ class TestFullFlowsheetBioPFalse:
             0.24219, rel=1e-3
         )
         assert value(m.fs.Treated.properties[0].conc_mass_comp["S_A"]) == pytest.approx(
-            6.4300e-07, abs=1e-6
+            6.43000895e-07, abs=1e-6
         )
         assert value(m.fs.Treated.properties[0].conc_mass_comp["S_F"]) == pytest.approx(
-            0.00027610, rel=1e-3
+            0.0002760866, rel=1e-3
         )
         assert value(m.fs.Treated.properties[0].conc_mass_comp["S_I"]) == pytest.approx(
-            0.057450, rel=1e-3
+            0.057450006, rel=1e-3
         )
         assert value(
             m.fs.Treated.properties[0].conc_mass_comp["S_N2"]
-        ) == pytest.approx(0.052060, rel=1e-3)
+        ) == pytest.approx(0.0520459, rel=1e-3)
         assert value(
             m.fs.Treated.properties[0].conc_mass_comp["S_NH4"]
-        ) == pytest.approx(0.00017686, rel=1e-3)
+        ) == pytest.approx(0.0001769519, rel=1e-3)
         assert value(
             m.fs.Treated.properties[0].conc_mass_comp["S_NO3"]
-        ) == pytest.approx(0.0060483, rel=1e-3)
+        ) == pytest.approx(0.006044579, rel=1e-3)
         assert value(
             m.fs.Treated.properties[0].conc_mass_comp["S_O2"]
-        ) == pytest.approx(0.0076767, rel=1e-3)
+        ) == pytest.approx(0.00767666, rel=1e-3)
         assert value(
             m.fs.Treated.properties[0].conc_mass_comp["S_PO4"]
-        ) == pytest.approx(0.65267, rel=1e-3)
+        ) == pytest.approx(0.6527876, rel=1e-3)
         assert value(m.fs.Treated.properties[0].conc_mass_comp["S_K"]) == pytest.approx(
-            0.36810, rel=1e-3
+            0.36809549, rel=1e-3
         )
         assert value(
             m.fs.Treated.properties[0].conc_mass_comp["S_Mg"]
-        ) == pytest.approx(0.018654, rel=1e-3)
+        ) == pytest.approx(0.01865257, rel=1e-3)
         assert value(
             m.fs.Treated.properties[0].conc_mass_comp["S_IC"]
-        ) == pytest.approx(0.15148, rel=1e-3)
+        ) == pytest.approx(0.1507046, rel=1e-3)
         assert value(
             m.fs.Treated.properties[0].conc_mass_comp["X_AUT"]
-        ) == pytest.approx(0.00041597, rel=1e-3)
+        ) == pytest.approx(0.000415746, rel=1e-3)
         assert value(m.fs.Treated.properties[0].conc_mass_comp["X_H"]) == pytest.approx(
-            0.013371, rel=1e-3
+            0.0133707, rel=1e-3
         )
         assert value(m.fs.Treated.properties[0].conc_mass_comp["X_I"]) == pytest.approx(
-            0.012360, rel=1e-3
+            0.01235979, rel=1e-3
         )
         assert value(
             m.fs.Treated.properties[0].conc_mass_comp["X_PAO"]
-        ) == pytest.approx(0.011077, rel=1e-3)
+        ) == pytest.approx(0.0110803, rel=1e-3)
         assert value(
             m.fs.Treated.properties[0].conc_mass_comp["X_PHA"]
-        ) == pytest.approx(5.0389e-06, abs=1e-6)
+        ) == pytest.approx(5.0389213e-06, abs=1e-6)
         assert value(
             m.fs.Treated.properties[0].conc_mass_comp["X_PP"]
-        ) == pytest.approx(0.0036998, rel=1e-3)
+        ) == pytest.approx(0.00370076, rel=1e-3)
         assert value(m.fs.Treated.properties[0].conc_mass_comp["X_S"]) == pytest.approx(
-            0.00021570, rel=1e-3
+            0.0002157186, rel=1e-3
         )
 
     @pytest.mark.component
@@ -115,12 +119,22 @@ class TestFullFlowsheetBioPFalse:
         m = system_frame
 
         # check costing
-        assert value(m.fs.costing.LCOW) == pytest.approx(0.468069, rel=1e-3)
+        assert value(m.fs.costing.LCOW) == pytest.approx(0.468069088, rel=1e-3)
         assert value(m.fs.costing.total_capital_cost) == pytest.approx(
-            23935727.742, rel=1e-3
+            23935727.743, rel=1e-3
         )
         assert value(m.fs.costing.total_operating_cost) == pytest.approx(
-            827635.25, rel=1e-3
+            827635.247, rel=1e-3
+        )
+
+    @pytest.mark.component
+    def test_condition_number(self, system_frame):
+        m = system_frame
+
+        # Check condition number to confirm scaling
+        jac, _ = get_jacobian(m, scaled=False)
+        assert (jacobian_cond(jac=jac, scaled=False)) == pytest.approx(
+            2.36720268e18, rel=1e-3
         )
 
 
@@ -211,4 +225,14 @@ class TestFullFlowsheetBioPTrue:
         )
         assert value(m.fs.costing.total_operating_cost) == pytest.approx(
             830582.94, rel=1e-3
+        )
+
+    @pytest.mark.component
+    def test_condition_number(self, system_frame):
+        m = system_frame
+
+        # Check condition number to confirm scaling
+        jac, _ = get_jacobian(m, scaled=False)
+        assert (jacobian_cond(jac=jac, scaled=False)) == pytest.approx(
+            3.208168033e18, rel=1e-3
         )

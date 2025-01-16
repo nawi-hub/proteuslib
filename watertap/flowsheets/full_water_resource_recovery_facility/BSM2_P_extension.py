@@ -88,6 +88,11 @@ from watertap.costing.unit_models.clarifier import (
     cost_circular_clarifier,
     cost_primary_clarifier,
 )
+from idaes.core.scaling.custom_scaler_base import (
+    CustomScalerBase,
+    ConstraintScalingScheme,
+)
+
 
 # Set up logger
 _log = idaeslog.getLogger(__name__)
@@ -373,11 +378,6 @@ def build(bio_P=False):
         doc="Dissolved oxygen concentration at equilibrium",
     )
 
-    m.fs.aerobic_reactors = (m.fs.R5, m.fs.R6, m.fs.R7)
-    for R in m.fs.aerobic_reactors:
-        iscale.set_scaling_factor(R.KLa, 1e-2)
-        iscale.set_scaling_factor(R.hydraulic_retention_time[0], 1e-3)
-
     @m.fs.R5.Constraint(m.fs.time, doc="Mass transfer constraint for R3")
     def mass_transfer_R5(self, t):
         return pyo.units.convert(
@@ -526,53 +526,55 @@ def set_operating_conditions(m, bio_P=False):
     m.fs.thickener.hydraulic_retention_time.fix(86400 * pyo.units.s)
     m.fs.thickener.diameter.fix(10 * pyo.units.m)
 
+    scaler = CustomScalerBase()
+
     def scale_variables(m):
         for var in m.fs.component_data_objects(pyo.Var, descend_into=True):
             if "flow_vol" in var.name:
-                iscale.set_scaling_factor(var, 1e0)
+                iscale.set_scaling_factor(var, 1e3)
             if "temperature" in var.name:
                 iscale.set_scaling_factor(var, 1e-2)
             if "pressure" in var.name:
                 iscale.set_scaling_factor(var, 1e-5)
             if "conc_mass_comp" in var.name:
-                iscale.set_scaling_factor(var, 1e1)
+                if bio_P:
+                    iscale.set_scaling_factor(var, 1e1)
+                else:
+                    iscale.set_scaling_factor(var, 1e2)
             if "anions" in var.name:
                 iscale.set_scaling_factor(var, 1e2)
             if "cations" in var.name:
                 iscale.set_scaling_factor(var, 1e2)
 
-    for unit in ("R1", "R2", "R3", "R4"):
-        block = getattr(m.fs, unit)
-        iscale.set_scaling_factor(block.hydraulic_retention_time, 1e-3)
+    def scale_constraints(m):
+        for c in m.fs.component_data_objects(pyo.Constraint, descend_into=True):
+            if "flow_vol_equality" in c.name:
+                scaler.scale_constraint_by_nominal_value(
+                    c,
+                    scheme=ConstraintScalingScheme.inverseMaximum,
+                    overwrite=True,
+                )
 
-    for unit in ("R1", "R2", "R3", "R4", "R5", "R6", "R7"):
-        block = getattr(m.fs, unit)
-        iscale.set_scaling_factor(
-            block.control_volume.reactions[0.0].rate_expression, 1e3
-        )
-        iscale.set_scaling_factor(block.cstr_performance_eqn, 1e3)
-        iscale.set_scaling_factor(
-            block.control_volume.rate_reaction_stoichiometry_constraint, 1e3
-        )
-        iscale.set_scaling_factor(block.control_volume.material_balances, 1e3)
-
-    iscale.set_scaling_factor(m.fs.AD.KH_co2, 1e1)
-    iscale.set_scaling_factor(m.fs.AD.KH_ch4, 1e1)
-    iscale.set_scaling_factor(m.fs.AD.KH_h2, 1e2)
+    m.fs.aerobic_reactors = (m.fs.R5, m.fs.R6, m.fs.R7)
+    for R in m.fs.aerobic_reactors:
+        iscale.set_scaling_factor(R.KLa, 1e-2)
+        iscale.set_scaling_factor(R.hydraulic_retention_time[0], 1e-3)
 
     if bio_P:
         iscale.set_scaling_factor(m.fs.AD.liquid_phase.heat, 1e3)
-        iscale.constraint_scaling_transform(
-            m.fs.AD.liquid_phase.enthalpy_balances[0], 1e-6
-        )
     else:
-        iscale.set_scaling_factor(m.fs.AD.liquid_phase.heat, 1e2)
-        iscale.constraint_scaling_transform(
-            m.fs.AD.liquid_phase.enthalpy_balances[0], 1e-3
+        iscale.set_scaling_factor(m.fs.AD.liquid_phase.heat, 1e4)
+        scaler.scale_constraint_by_nominal_value(
+            m.fs.AD.liquid_phase.enthalpy_balances[0],
+            scheme=ConstraintScalingScheme.inverseMinimum,
+            overwrite=True,
         )
+        iscale.set_scaling_factor(m.fs.AD.hydraulic_retention_time[0], 1e-6)
+        iscale.constraint_scaling_transform(m.fs.AD.AD_retention_time[0], 1e-4)
 
     # Apply scaling
     scale_variables(m)
+    scale_constraints(m)
     iscale.calculate_scaling_factors(m)
 
 
