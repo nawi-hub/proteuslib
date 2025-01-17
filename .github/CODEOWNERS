@@ -1,0 +1,56 @@
+* @lbianchi-lbl
+
+.binder/ @lbianchi-lbl
+.github/ @lbianchi-lbl
+setup.py @lbianchi-lbl
+pyproject.toml @lbianchi-lbl
+pytest*.ini @lbianchi-lbl
+docs/conf.py @lbianchi-lbl
+conftest.py @lbianchi-lbl
+requirements*.txt @lbianchi-lbl
+environment*.yml @lbianchi-lbl
+.git* @lbianchi-lbl
+
+/docs/ @MarcusHolly @adam-a-a
+
+/tutorials/ @adam-a-a @zacharybinger @avdudchenko @MarcusHolly @TimBartholomew
+
+/watertap/core/ @bknueven @adam-a-a
+
+/watertap/costing/ @bknueven @adam-a-a
+
+/watertap/flowsheets/activated_sludge/ @agarciadiego @luohezhiming @MarcusHolly @adam-a-a @Morgan88888888
+/watertap/flowsheets/anaerobic_digester/ @agarciadiego @adam-a-a @MarcusHolly @luohezhiming @Morgan88888888
+/watertap/flowsheets/crystallization/ @OOAmusat
+/watertap/flowsheets/dye_desalination/ @MarcusHolly @adam-a-a
+/watertap/flowsheets/electrodialysis/ @lbibl
+/watertap/flowsheets/electroNP/ @luohezhiming @adam-a-a @MarcusHolly
+/watertap/flowsheets/full_water_resource_recovery_facility/ @MarcusHolly @luohezhiming @adam-a-a @agarciadiego @Morgan88888888
+/watertap/flowsheets/gac/ @adam-a-a @MarcusHolly
+/watertap/flowsheets/generic_desalination_train/ @avdudchenko
+/watertap/flowsheets/ion_exchange/ @kurbansitterley
+/watertap/flowsheets/lsrro/ @adam-a-a @TimBartholomew @bknueven
+/watertap/flowsheets/MD/ @ElmiraShamlou @adam-a-a
+/watertap/flowsheets/mvc/ @carson-tucker
+/watertap/flowsheets/nf_dspmde/ @avdudchenko @adam-a-a
+/watertap/flowsheets/oaro/ @luohezhiming @adam-a-a @zacharybinger
+/watertap/flowsheets/RO_with_energy_recovery/ @adam-a-a @TimBartholomew @MarcusHolly @luohezhiming
+/watertap/flowsheets/seawater_RO_desalination/ @adam-a-a @TimBartholomew @MarcusHolly @luohezhiming
+
+/watertap/property_models/ @adam-a-a
+/watertap/property_models/unit_specific/activated_sludge/ @MarcusHolly @luohezhiming @adam-a-a @agarciadiego @Morgan88888888
+/watertap/property_models/unit_specific/anaerobic_digestion/ @MarcusHolly @luohezhiming @adam-a-a @agarciadiego @Morgan88888888
+
+/watertap/tools/ @bknueven @adam-a-a @k1nshuk @avdudchenko
+
+/watertap/unit_models/ @adam-a-a
+/watertap/unit_models/MD/ @ElmiraShamlou @adam-a-a
+/watertap/unit_models/mvc/ @carson-tucker
+/watertap/unit_models/translators/ @MarcusHolly @luohezhiming @adam-a-a
+/watertap/unit_models/zero_order/ @adam-a-a
+
+LICENSE.md @ksbeattie
+COPYRIGHT.md @ksbeattie
+
+CITATION.cff @TimBartholomew
+
